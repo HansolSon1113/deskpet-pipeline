@@ -1,6 +1,5 @@
 # DeskPet Swift Pipeline
 
-2026-09-29의 `DeskPet Interface Contracts` wiki를 기준으로 구현한 Swift 6 패키지입니다.
 모델·서버·장치 구현은 교체 가능한 protocol로 분리했고 기본 실행은 합성 fixture와 mock만 사용합니다.
 구조도보다 wiki의 역할·컨텍스트·완료 이벤트 계약을 우선했습니다. 패키지는 외부 의존성이 없습니다.
 
@@ -18,7 +17,7 @@ Xcode에서 `Package.swift`를 열어 사용할 수 있습니다. macOS에서 �
 
 각 모듈은 모델/API 클라이언트 등의 역할 자원을 소유하고, 작업 제출과 완료 처리를 분리합니다.
 `PipelineModule`에는 제출 루프 하나와 완료 처리 루프 하나가 있습니다. 모든 모듈이 독립적으로 진행하며
-같은 요청 안에서 결과가 필요한 작업만 기다립니다. 모듈별 복수 워커와 공유 모델 스레드 풀은 제거했습니다.
+같은 요청 안에서 결과가 필요한 작업만 기다립니다.
 
 ```mermaid
 flowchart LR
