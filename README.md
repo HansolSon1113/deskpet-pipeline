@@ -38,6 +38,9 @@ GPU는 하나의 전담 OS 스레드가 연산 제출·완료 확인·결과 반
 스케줄러는 없습니다. 실제 런타임이 비동기 연산과 완료 handle을 제공하는 경계만 정의했습니다.
 [모듈 및 GPU 설계](docs/concurrency-design.md)에 책임과 연결 방식을 정리했습니다.
 
+[클래스 다이어그램](docs/class-diagrams.md)은 전체 소유권, 공통 모듈, 담당자별 통합 protocol과
+GPU 실행 경계를 현재 코드 기준으로 표현합니다. 모듈 통합 시 이 문서의 역할별 타입 표와 공개 인터페이스를 참고합니다.
+
 ## 사용 예
 
 ```swift
@@ -104,6 +107,26 @@ GPU 자원 회수를 기다립니다. 외부 변경의 unknown/confirmed 결과�
 [검증 범위](docs/validation.md)에 실행 결과와 미검증 경계를 기록합니다.
 
 ## 통합 경계
+
+### 서버 연결 시연
+
+형제 폴더의 `LLM_test`에서 `pnpm web:fixture`를 실행하고 켜 둡니다. 서버 기본 주소는
+`ws://127.0.0.1:8788`입니다. 이 저장소에서는 다음 명령을 실행합니다.
+
+```sh
+swift run deskpet-demo --connected-demo
+```
+
+Mock 발화 `보고서 제출 상태 알려줘` → Eureka 업무 조회, `DeskPet PR 42 리뷰해줘` → Harness PR 리뷰가
+Swift pipeline의 실제 서버 adapter를 통해 처리되고, 서버 결과와 최종 발화가 터미널에 표시됩니다.
+두 작업의 성공과 출력 완료를 확인하면 `pipeline 출력 완료 2/2`를 출력합니다. 서버 미가동·인증 실패·
+업무 실패를 성공으로 표시하지 않습니다. STT/라우터/출력 모델/TTS/장치와 외부 업무 데이터는 mock/fixture입니다.
+
+`--connected-demo`에서만 fixture 주소·전용 토큰을 기본값으로 사용합니다.
+다른 서버는 `HARNESS_WS_URL`·`HARNESS_WS_TOKEN`으로 지정합니다. 두 저장소에서 동시에 서버를
+새로 실행하지 않으며, `EADDRINUSE`가 나면 기존 서버가 같은 포트를 사용 중인지 확인합니다.
+시연은 하드웨어 서버 없이 실행합니다. `DESKPET_SERVER_TESTS=1 swift test`로 두 adapter의
+pipeline 연결 회귀를 확인할 수 있습니다.
 
 [계약 대응표](docs/interface-map.md)에 I-01~I-23 연결 지점을 정리했습니다.
 `Adapters.gpuMocks(executor:)`는 라우터·출력 모델의 GPU 호출을 mock 처리합니다. 실제 모델·추론 런타임,

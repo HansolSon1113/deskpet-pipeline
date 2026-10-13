@@ -573,7 +573,8 @@ public actor DeskPetPipeline {
                     return try await api.run(HarnessRequest(action: request, transcript: job.envelope.payload, context: input))
                 }
                 guard let eureka else { throw CancellationError() }
-                return HarnessResult(action: try await eureka.execute(request))
+                let result = try await eureka.execute(request)
+                return HarnessResult(action: result, question: result.facts["question"], resultText: result.facts["resultText"])
             }
         } catch {
             // Once dispatched, lost mutation replies and cancellation are not confirmed failure.
@@ -648,6 +649,7 @@ public actor DeskPetPipeline {
                 if let value = action.facts["priority"] { return "\(name) 우선순위를 \(labels[value] ?? value)으로 변경했어요." }
                 return "\(name) 우선순위를 변경했어요."
             case .query:
+                if let resultText { return resultText }
                 var text = action.facts["description"] ?? "\(name) 정보를 확인했어요."
                 if let value = action.facts["dueAt"], let date = ISO8601DateFormatter().date(from: value) {
                     text += " 마감은 \(DateCodec.humanDateTime(date))이에요."

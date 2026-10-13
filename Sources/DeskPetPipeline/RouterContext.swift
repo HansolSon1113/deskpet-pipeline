@@ -138,7 +138,7 @@ public enum DecisionComposer {
         if !reliable || !sttReliable || !missing.isEmpty || intent == .unclear { route = .harness }
         else if intent == .chat { route = .output }
         else if [.acknowledgeReminder, .snoozeReminder].contains(intent) { route = .reminder }
-        else if intent == .mcp { route = .harness }
+        else if [.mcp, .reviewPR].contains(intent) { route = .harness }
         else { route = .eureka }
         return RouteDecision(headOutputs: heads, overallConfidence: confidence, missingRequiredSlots: missing,
                              route: route, sourceTurnIds: input.turns.map(\.turnId) + [input.turnId], resolvedTarget: target)

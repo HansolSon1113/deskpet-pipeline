@@ -34,6 +34,7 @@ public enum Intent: String, Sendable, Codable {
     case register = "eureka.register", query = "eureka.query", complete = "eureka.complete"
     case postpone = "eureka.postpone", updatePriority = "eureka.priority"
     case mcp = "mcp.task", chat = "chat", unclear = "unclear"
+    case reviewPR = "pr.review"
     case acknowledgeReminder = "reminder.acknowledge", snoozeReminder = "reminder.snooze"
     public var isMutation: Bool { [.register, .complete, .postpone, .updatePriority, .mcp].contains(self) }
 }
@@ -61,8 +62,12 @@ public struct Target: Sendable, Codable, Equatable {
     public var kind: String
     public var entityId: String
     public var name: String
-    public init(kind: String = "item", entityId: String, name: String) {
+    public var repository: [String: String]?
+    public var prNumber: Int?
+    public init(kind: String = "item", entityId: String, name: String,
+                repository: [String: String]? = nil, prNumber: Int? = nil) {
         self.kind = kind; self.entityId = entityId; self.name = name
+        self.repository = repository; self.prNumber = prNumber
     }
     public func isSameEntity(as other: Target) -> Bool { kind == other.kind && entityId == other.entityId }
 }
