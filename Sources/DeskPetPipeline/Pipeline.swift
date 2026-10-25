@@ -25,6 +25,7 @@ private struct Job: Sendable {
     var terminal = true
     var operationId = UUID()
     var targetResolution: TargetResolution?
+    var inputEpoch: Int64?
     var executionToken: UUID { terminal ? token : (output?.outputId ?? token) }
 }
 
@@ -80,6 +81,24 @@ public actor DeskPetPipeline {
     private var waitingQuestion: (conversation: String, request: UUID, output: UUID)?
     private var droppedEvents = 0
     private var speechSessions: [UUID: Job] = [:]
+    private var inputEpoch: Int64?
+    private var inputBlocked = false
+    private var cancelledTokens: Set<UUID> = []
+
+    public func acceptsInput(epoch: Int64?) -> Bool {
+        !inputBlocked && (inputEpoch == nil || epoch == inputEpoch)
+    }
+    /// Invalidate synchronously before the first cancellation await can reenter this actor.
+    public func invalidateInput(epoch: Int64) async {
+        inputEpoch = epoch; inputBlocked = true
+        let sessions = Array(speechSessions.keys)
+        cancelledTokens.formUnion(sessions)
+        for session in sessions { await cancelSpeech(sessionId: session) }
+    }
+    public func resumeInput(epoch: Int64) {
+        guard inputEpoch == epoch else { return }
+        inputBlocked = false
+    }
 
     public init(adapters: Adapters, configuration: PipelineConfiguration = .init()) throws {
         try configuration.validate(); config = configuration; self.adapters = adapters
@@ -198,7 +217,14 @@ public actor DeskPetPipeline {
     private func emit(_ event: PipelineEvent) {
         if case .dropped = eventSink.yield(event) { droppedEvents += 1 }
     }
-    public func isAudioInputAllowed() -> Bool { running }
+    private func showActivity(_ activity: Activity, conversation: String) async {
+        if let display = adapters.display as? any ActivityDisplayAdapter {
+            do { try await display.activity(activity) }
+            catch { emit(.error(nil, PipelineError("DISPLAY_ERROR", stage: "display.activity"))) }
+        }
+        emit(.activity(conversation, activity))
+    }
+    public func isAudioInputAllowed() -> Bool { running && !inputBlocked }
     public func reportAudioError(_ error: PipelineError) { emit(.error(nil, error)) }
     public func droppedEventCount() -> Int { droppedEvents }
     public func record(requestId: UUID) -> RequestRecord? { records[requestId] }
@@ -270,7 +296,7 @@ public actor DeskPetPipeline {
         await cancelReminder()
         clearQuestion(); displayTimer?.cancel()
         if let operations = cancellation[idleDisplayToken] { for cancel in operations.values { cancel() } }
-        emit(.accepted(envelope.requestId)); emit(.activity(envelope.conversationId, .processing))
+        emit(.accepted(envelope.requestId)); await showActivity(.processing, conversation: envelope.conversationId)
         return envelope.requestId
     }
     // Admission returns immediately after the bounded STT queue accepts the segment.
@@ -299,20 +325,22 @@ public actor DeskPetPipeline {
     }
     // Streaming sessions retain no PCM in the coordinator. VAD frames are admitted
     // independently of inference completion; the STT module consumes them in order.
-    public func beginSpeech(conversationId: String) async throws -> UUID {
+    public func beginSpeech(conversationId: String, inputEpoch: Int64? = nil) async throws -> UUID {
+        guard acceptsInput(epoch: inputEpoch) else { throw PipelineError("STALE_INPUT", stage: "stt.stream") }
         guard running, active.count < config.maxInFlight else { throw PipelineError("QUEUE_FULL", stage: "stt.stream") }
         guard adapters.stt is any StreamingSpeechRecognizer else { throw PipelineError("STREAMING_STT_UNAVAILABLE", stage: "stt.stream") }
         guard conversationId.utf8.count <= 256 else { throw PipelineError("INPUT_TOO_LARGE", stage: "stt.stream") }
         let envelope = Envelope(conversationId: conversationId, deadlineAt: Date().addingTimeInterval(config.requestTimeout),
                                 kind: "audio.stream", payload: Transcript(text: ""))
         try reserveRecord(envelope.requestId)
-        let job = Job(envelope: envelope); let previous = latest[conversationId]
+        var job = Job(envelope: envelope); job.inputEpoch = inputEpoch; let previous = latest[conversationId]
         active[job.token] = job; latest[conversationId] = job.token; speechSessions[job.token] = job
         if let previous { await cancelToken(previous) }
         await interact(.speechStarted(conversationId)); emit(.accepted(envelope.requestId))
         return job.token
     }
     public func submitSpeechFrame(sessionId: UUID, frame: AudioFrame, activity: VoiceActivity) async throws {
+        guard acceptsInput(epoch: frame.inputEpoch) else { throw PipelineError("STALE_INPUT", stage: "stt.stream") }
         guard let job = speechSessions[sessionId], current(job) else { throw PipelineError("CANCELLED", stage: "stt.stream") }
         guard frame.chunk.data.count <= config.maxChunkBytes else { throw PipelineError("INPUT_TOO_LARGE", stage: "stt.frame") }
         do { try await sttQueue.offer(AudioJob(job: job, frame: STTFrame(sessionId: sessionId, frame: frame, activity: activity))) }
@@ -363,7 +391,7 @@ public actor DeskPetPipeline {
         records[request] = RequestRecord(requestId: request); recordOrder.append(request)
     }
     private func current(_ job: Job) -> Bool {
-        running && active[job.token] != nil && latest[job.envelope.conversationId] == job.token &&
+        running && !cancelledTokens.contains(job.token) && (job.inputEpoch == nil || acceptsInput(epoch: job.inputEpoch)) && active[job.token] != nil && latest[job.envelope.conversationId] == job.token &&
         (job.envelope.deadlineAt ?? .distantPast) > Date()
     }
     private func timeout(_ job: Job, _ stage: TimeInterval) -> TimeInterval {
@@ -386,6 +414,7 @@ public actor DeskPetPipeline {
         await cancelToken(token)
     }
     private func cancelToken(_ token: UUID) async {
+        cancelledTokens.insert(token)
         if let operations = cancellation[token] { for cancel in operations.values { cancel() } }
         if speechSessions.removeValue(forKey: token) != nil, let streaming = adapters.stt as? any StreamingSpeechRecognizer {
             await streaming.cancel(sessionId: token)
@@ -407,9 +436,11 @@ public actor DeskPetPipeline {
             deliveries.removeValue(forKey: id)
         }
         if let retiring, apiInFlight[token] == nil { finish(retiring) }
+        if active[token] == nil { cancelledTokens.remove(token) }
         // An in-flight mutation is allowed to report unknown/confirmed execution independently of output.
     }
     private func finish(_ job: Job) {
+        cancelledTokens.remove(job.token)
         guard active.removeValue(forKey: job.token) != nil else { return }
         if latest[job.envelope.conversationId] == job.token { latest.removeValue(forKey: job.envelope.conversationId) }
         progressTimers.removeValue(forKey: job.token)?.cancel()
@@ -843,7 +874,8 @@ public actor DeskPetPipeline {
             reminderHistory[reminder.key] = (reminder.dueAt, true, nil); currentReminder = reminder
         }
         quietUntil = Date().addingTimeInterval(config.reminderQuietInterval + (textFallback ? config.textDisplayDuration : 0))
-        if job.output?.isQuestion == true { beginQuestion(job, outputId: event.outputId) }
+        if job.output?.isQuestion == true { await beginQuestion(job, outputId: event.outputId) }
+        guard current(job) else { return }
         if textFallback { beginDisplayTimer() }
     }
     private func finalizeDelivery(_ outputId: UUID) async {
@@ -857,23 +889,23 @@ public actor DeskPetPipeline {
         if job.terminal {
             finish(job)
             if audio == .completed, job.output?.isQuestion != true {
-                emit(.activity(job.envelope.conversationId, .idle))
+                await showActivity(.idle, conversation: job.envelope.conversationId)
             }
         }
     }
-    private func beginQuestion(_ job: Job, outputId: UUID) {
+    private func beginQuestion(_ job: Job, outputId: UUID) async {
         clearQuestion()
         waitingQuestion = (job.envelope.conversationId, job.envelope.requestId, outputId)
-        emit(.activity(job.envelope.conversationId, .awaitingAnswer))
         questionTimer = Task { [weak self, config] in
             do { try await Task.sleep(for: .seconds(config.questionWait)); await self?.expireQuestion(outputId) } catch {}
         }
+        await showActivity(.awaitingAnswer, conversation: job.envelope.conversationId)
     }
     private func clearQuestion() { questionTimer?.cancel(); questionTimer = nil; waitingQuestion = nil }
     private func expireQuestion(_ output: UUID) async {
         guard let question = waitingQuestion, question.output == output else { return }
         emit(.questionWaitExpired(question.request, output)); clearQuestion()
-        await context.clearPending(question.conversation); emit(.activity(question.conversation, .idle))
+        await context.clearPending(question.conversation); await showActivity(.idle, conversation: question.conversation)
     }
     private func beginDisplayTimer() {
         displayTimer?.cancel()
@@ -888,9 +920,10 @@ public actor DeskPetPipeline {
     }
     public func interact(_ event: InteractionEvent) async {
         switch event {
+        case .touch(let touch): emit(.touch(touch))
         case .speechStarted(let conversation):
             clearQuestion(); displayTimer?.cancel(); quietUntil = Date().addingTimeInterval(config.reminderQuietInterval)
-            await cancelReminder(); emit(.activity(conversation, .listening))
+            await cancelReminder(); await showActivity(.listening, conversation: conversation)
         case .cancel(let conversation): await cancel(conversationId: conversation)
         case .acknowledgeReminder: acknowledgeReminder()
         case .snoozeReminder(let seconds): snoozeReminder(seconds: seconds)

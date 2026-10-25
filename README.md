@@ -1,5 +1,7 @@
 # DeskPet Swift Pipeline
 
+Orin Nano용 연결 target·합성 보드 실행기는 [하드웨어 통합 안내](docs/hardware-integration.md)를 참고하세요. `deskpet-hardware`를 형제 폴더에 두어야 패키지 의존성을 해석할 수 있습니다.
+
 모델·서버·장치 구현은 교체 가능한 protocol로 분리했고 기본 실행은 합성 fixture와 mock만 사용합니다.
 구조도보다 wiki의 역할·컨텍스트·완료 이벤트 계약을 우선했습니다. 패키지는 외부 의존성이 없습니다.
 
@@ -65,7 +67,7 @@ await pipeline.shutdown()
 - TTS에서 재생 큐로 전달할 때는 빈자리를 기다리는 역압력을 적용합니다. 재생 큐 포화만으로 음성을 폐기하지 않으며 대기 생산자는 하나로 제한합니다.
 - 각 진행 중 작업은 완료 큐 슬롯도 예약합니다. 완료 처리까지 슬롯을 유지해 결과 적체 시 무제한 task 생성을 막습니다. API 포화는 호출 전 `API_BUSY`, GPU admission 포화는 `GPU_BUSY`, 입력 큐 포화는 `QUEUE_FULL`입니다.
 - 전체 요청 64건, journal/진단 이벤트 256건, 대화 8세션·세션당 16턴/UTF-8 8 KiB, 입력 4 KiB·출력 8 KiB로 제한합니다. native adapter 내부 모델 weights/workspace/KV cache 상한은 해당 모델 모듈 책임입니다.
-- `AudioIngress`는 CPU VAD의 speech 프레임을 즉시 STT 큐에 전달합니다. 발화 종료와 추론 완료를 기다려 PCM을 모으지 않으며, 출력 재생으로 입력을 차단하지 않습니다. partial은 진단에만 전달하고 final만 라우팅합니다. STT/TTS의 CPU/GPU 배치는 미정입니다.
+- `AudioIngress`는 CPU VAD의 speech 프레임을 즉시 STT 큐에 전달합니다. 발화 종료와 추론 완료를 기다려 PCM을 모으지 않습니다. 하드웨어 연결에서는 재생 전부터 실제 완료+300ms 및 듣기 화면 ack까지 입력 전달을 차단하고 epoch가 지난 결과를 폐기합니다. partial은 진단에만 전달하고 final만 라우팅합니다. STT/TTS의 CPU/GPU 배치는 미정입니다.
 - 프레임 큐 또는 발화 크기 상한 초과 시 오류를 보고하고 해당 발화를 무효화해 잘린 명령이 실행되지 않게 합니다. 유한 버퍼로 무제한 입력을 보존할 수 없으므로 실제 캡처 backlog·STT 처리율은 Jetson에서 측정해야 합니다. AEC는 실제 장치 adapter의 통합 대상입니다.
 - 라우터 2초, STT/출력 5초, Eureka 8초, Harness 30초, TTS 첫 chunk 3초, 재생 30초·요청 60초는 임시값입니다. `PipelineConfiguration`으로 조정합니다.
 - `snapshot()`은 입력 큐와 모듈별 제출·완료 처리·진행 중 호출·완료 큐를 제공합니다. `measurements()`는 최근 256개 표본의 p50/p95를 제공합니다. 실제 모델/GPU 성능 측정을 대신하지 않습니다.

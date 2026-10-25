@@ -1,5 +1,13 @@
 # 모듈 파이프라인 검증
 
+## 2026-10-25 보드 연결 준비
+
+Ubuntu 22.04 WSL x86_64·Swift 6.0.3 strict-concurrency / warnings-as-errors로 코어와 하드웨어 연결부 **67개 테스트**를 통과했습니다. `DESKPET_TEST_SOCKET`으로 실제 C++ 데몬에 연결했고 입력 epoch·늦은 STT final·터치·재생 형식·실제 drain+300ms·정지 불명·긴 재생 중 캡처 watchdog을 검증했습니다.
+
+`deskpet-board --seconds 60`으로 합성 음성 입력부터 팀 파이프라인·실제 Unix 소켓·C++ 모의 장치까지 **101회** 전달 완료를 확인했습니다. 실제 모델·외부 업무 서버·물리 주변 장치·Jetson ARM64 검증은 포함하지 않습니다. 실행은 [하드웨어 통합 안내](hardware-integration.md)를 따릅니다.
+
+아래는 기존 2026-09-29 검증 기록입니다.
+
 검증일: 2026-09-29. Swift 6 패키지, macOS arm64 환경에서 검증한다.
 실제 모델·GPU·Jetson·REST/MCP·장치 드라이버를 사용한 통합 테스트는 아니다.
 
@@ -40,7 +48,7 @@ mock 연결 및 정리 검증이며 실제 GPU 처리량·추론 지연 측정�
 
 ## 실제 통합에서 남은 검증
 
-- Linux/Jetson의 Swift toolchain·빌드 및 native runtime 연결.
+- Jetson ARM64의 Swift toolchain·빌드 및 native runtime 연결. Linux x86_64 소프트웨어 연결은 2026-10-25 검증 완료.
 - 추론/출력 모델의 TensorRT 또는 다른 런타임 결정, 비동기 제출/completion handle 계약.
 - STT 실행 위치 결정과 한국어 인식률·partial/final·프레임 처리율·최대 backlog.
 - TTS 실행 위치 결정, 실제 PCM 포맷과 재생 완료 ack, AEC.
