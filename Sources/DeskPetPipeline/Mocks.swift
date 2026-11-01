@@ -88,7 +88,13 @@ public actor MockEureka: EurekaAdapter {
         let intent = request.decision.headOutputs.intention.value
         let target = request.decision.resolvedTarget
         let result: ActionResult
-        if intent == .register, let name = request.decision.headOutputs.name.value {
+        let supported: Set<Intent> = [.register, .create, .postpone, .complete, .updatePriority, .setPriority, .query]
+        guard supported.contains(intent) else {
+            return ActionResult(operationId: request.operationId, status: .failed, action: intent, target: target,
+                error: PipelineError("EUREKA_OPERATION_NOT_IMPLEMENTED", stage: "eureka", message: intent.rawValue))
+        }
+        let newName = intent == .create ? request.decision.headOutputs.task.value : request.decision.headOutputs.name.value
+        if [.register, .create].contains(intent), let name = newName {
             let created = Target(entityId: UUID().uuidString, name: name)
             items[created.entityId] = ReminderItem(target: created, description: request.decision.headOutputs.task.value ?? name,
                                                   dueAt: request.decision.headOutputs.dueAt.value ?? Date().addingTimeInterval(86_400))
@@ -100,7 +106,7 @@ public actor MockEureka: EurekaAdapter {
                 guard let due = request.decision.headOutputs.dueAt.value else { throw PipelineError("MISSING_SLOT", stage: "eureka") }
                 item.dueAt = due; facts["dueAt"] = DateCodec.rfc3339(due)
             case .complete: item.eligible = false; facts["completed"] = "true"
-            case .updatePriority: facts["priority"] = request.decision.headOutputs.priority.value
+            case .updatePriority, .setPriority: facts["priority"] = request.decision.headOutputs.priority.value
             case .query: facts = ["description": item.description, "dueAt": DateCodec.rfc3339(item.dueAt)]
             default: break
             }

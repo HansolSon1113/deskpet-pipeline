@@ -30,6 +30,12 @@ playground.xcworkspace
 # .swiftpm
 
 .build/
+Models/**
+!Models/*.example.json
+!Models/README.md
+.DS_Store
+.env
+out/
 
 # CocoaPods
 #

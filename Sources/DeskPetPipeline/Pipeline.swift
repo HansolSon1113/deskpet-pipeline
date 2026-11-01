@@ -20,6 +20,8 @@ private struct Job: Sendable {
     var stamp: ContextStamp?
     var decision: RouteDecision?
     var reminder: ReminderItem?
+    var scenarioReminderTarget: Target?
+    var isReminder: Bool { reminder != nil || scenarioReminderTarget != nil }
     var output: OutputRequest?
     var event: OutputEvent?
     var terminal = true
@@ -63,6 +65,11 @@ public actor DeskPetPipeline {
     private var harnessModule: PipelineModule<Job, any HarnessAdapter, HarnessResult>?
     private var apiInFlight: [UUID: Bool] = [:]
     private var reminderLoop: Task<Void, Never>?
+    private var noticeLoop: Task<Void, Never>?
+    private var noticeJobs: [UUID: Job] = [:]
+    private var earlyNotices: [UUID: Data] = [:]
+    private var lastTurns: [String: UUID] = [:]
+    private var recordConversations: [UUID: String] = [:]
     private var starting = false
     private var running = false
     private var stopped = false
@@ -77,7 +84,7 @@ public actor DeskPetPipeline {
     private var reminderHistory: [String: (due: Date, delivered: Bool, snooze: Date?)] = [:]
     private var currentReminder: ReminderItem?
     private var quietUntil = Date.distantPast
-    private var waitingQuestion: (conversation: String, request: UUID, output: UUID)?
+    private var waitingQuestion: (conversation: String, request: UUID, output: UUID, pendingId: String?)?
     private var droppedEvents = 0
     private var speechSessions: [UUID: Job] = [:]
 
@@ -96,6 +103,10 @@ public actor DeskPetPipeline {
     }
     public func start(automaticReminders: Bool = true) async {
         guard !starting, !running, !stopped else { return }; starting = true
+        if let source = adapters.harness as? any HarnessNoticeSource {
+            let notices = await source.notices
+            noticeLoop = Task { [weak self] in for await data in notices { await self?.receiveHarnessNotice(data) } }
+        }
         install("stt", queue: sttQueue, resource: adapters.stt, limit: 1,
             execute: { [weak self] input, model in
                 guard let self else { throw CancellationError() }; return try await self.recognize(input, model: model)
@@ -177,7 +188,7 @@ public actor DeskPetPipeline {
     }
     public func shutdown() async {
         guard !stopped else { return }; stopped = true; running = false
-        questionTimer?.cancel(); displayTimer?.cancel()
+        questionTimer?.cancel(); displayTimer?.cancel(); noticeLoop?.cancel(); noticeLoop = nil
         for timer in progressTimers.values { timer.cancel() }; progressTimers.removeAll()
         for operations in cancellation.values { for cancel in operations.values { cancel() } }
         for channel in pcmChannels.values { await channel.finish(error: CancellationError()) }
@@ -192,7 +203,7 @@ public actor DeskPetPipeline {
         if let reminderLoop { await reminderLoop.value }
         if let executor = adapters.gpuExecutor { await executor.shutdown() }
         apiInFlight.removeAll()
-        active.removeAll(); latest.removeAll(); cancellation.removeAll()
+        active.removeAll(); latest.removeAll(); cancellation.removeAll(); noticeJobs.removeAll(); earlyNotices.removeAll(); lastTurns.removeAll(); recordConversations.removeAll()
         deliveries.removeAll(); pcmChannels.removeAll(); eventSink.finish()
     }
     private func emit(_ event: PipelineEvent) {
@@ -257,6 +268,8 @@ public actor DeskPetPipeline {
         job.targetResolution = preResolved
         let previous = latest[envelope.conversationId]
         latest[envelope.conversationId] = job.token; active[job.token] = job
+        lastTurns[envelope.conversationId] = envelope.turnId
+        recordConversations[envelope.requestId] = envelope.conversationId
         do { try await routerQueue.commit(job, reservation: reservation) }
         catch {
             active.removeValue(forKey: job.token)
@@ -270,7 +283,7 @@ public actor DeskPetPipeline {
         await cancelReminder()
         clearQuestion(); displayTimer?.cancel()
         if let operations = cancellation[idleDisplayToken] { for cancel in operations.values { cancel() } }
-        emit(.accepted(envelope.requestId)); emit(.activity(envelope.conversationId, .processing))
+        emit(.transcriptFinal(envelope)); emit(.accepted(envelope.requestId)); emit(.activity(envelope.conversationId, .processing))
         return envelope.requestId
     }
     // Admission returns immediately after the bounded STT queue accepts the segment.
@@ -340,6 +353,8 @@ public actor DeskPetPipeline {
                 return
             }
             guard current(job) else { finish(job); return }
+            if let epoch = audio.frame?.frame.inputEpoch, let validator = adapters.inputEpochValidator,
+               !validator.isCurrent(epoch) { await cancelSpeech(sessionId: job.token); return }
             guard transcript.isFinal else {
                 var partial = job.envelope; partial.kind = "stt.partial"; partial.payload = transcript; emit(.partial(partial))
                 if audio.frame == nil { finish(job) }; return
@@ -352,6 +367,32 @@ public actor DeskPetPipeline {
             reject(job, error: error)
         }
     }
+    private func receiveHarnessNotice(_ data: Data) async {
+        guard running, let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let notice = frame["notice"] as? [String: Any], let rawId = notice["requestId"] as? String,
+              let requestId = UUID(uuidString: rawId),
+              let action = notice["pipelineAction"] as? [String: Any], let rawStatus = action["status"] as? String,
+              let status = ActionStatus(rawValue: rawStatus) else { return }
+        guard var job = noticeJobs.removeValue(forKey: requestId) else {
+            if active.values.contains(where: { $0.envelope.requestId == requestId }), earlyNotices.count < config.journalCapacity {
+                earlyNotices[requestId] = data
+            }
+            return
+        }
+        let facts = action["facts"] as? [String: String] ?? [:]
+        let result = ActionResult(operationId: job.operationId, status: status,
+            action: job.decision?.headOutputs.intention.value ?? .harnessTask, target: job.decision?.resolvedTarget, facts: facts)
+        storeAction(job, result)
+        guard lastTurns[job.envelope.conversationId] == job.envelope.turnId,
+              latest[job.envelope.conversationId].map({ $0 == job.token }) ?? true else { return }
+        if active[job.token] != nil { await cancelToken(job.token) }
+        job.token = UUID(); job.admitted = ContinuousClock.now; job.output = nil; job.event = nil
+        job.envelope.deadlineAt = Date().addingTimeInterval(config.requestTimeout)
+        active[job.token] = job; latest[job.envelope.conversationId] = job.token
+        let response = HarnessResult(action: result, question: notice["pipelineQuestion"] as? String,
+                                     resultText: frame["resultText"] as? String)
+        await apiCompleted(job, result: .success(response), harness: true)
+    }
     private func reserveRecord(_ request: UUID) throws {
         guard records[request] == nil else { return }
         if records.count >= config.journalCapacity {
@@ -359,6 +400,9 @@ public actor DeskPetPipeline {
                 !active.values.contains(where: { $0.envelope.requestId == id }) && records[id]?.action?.status != .unknown
             }) else { throw PipelineError("JOURNAL_FULL", stage: "admission") }
             records.removeValue(forKey: evict); recordOrder.removeAll { $0 == evict }
+            noticeJobs.removeValue(forKey: evict); earlyNotices.removeValue(forKey: evict)
+            if let conversation = recordConversations.removeValue(forKey: evict),
+               !recordConversations.values.contains(conversation) { lastTurns.removeValue(forKey: conversation) }
         }
         records[request] = RequestRecord(requestId: request); recordOrder.append(request)
     }
@@ -380,7 +424,13 @@ public actor DeskPetPipeline {
         }
         return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
-    public func cancel(conversationId: String) async { await cancelConversation(conversationId); clearQuestion() }
+    public func cancel(conversationId: String) async {
+        let question = waitingQuestion.flatMap { $0.conversation == conversationId ? $0 : nil }
+        await cancelConversation(conversationId); clearQuestion(); await context.clearPending(conversationId)
+        if let question, question.pendingId != nil, let consumer = adapters.harness as? any HarnessEventConsumer {
+            try? await consumer.report(HarnessPipelineEvent(requestId: question.request, kind: "request_cancelled", pendingId: question.pendingId))
+        }
+    }
     private func cancelConversation(_ conversation: String) async {
         guard let token = latest.removeValue(forKey: conversation) else { return }
         await cancelToken(token)
@@ -483,12 +533,20 @@ public actor DeskPetPipeline {
             case .eureka: await dispatchAPI(job, harness: false)
             case .harness:
                 // Unsafe STT or missing slots never reach an adapter capable of external writes.
-                if !result.1.missingRequiredSlots.isEmpty || job.envelope.payload.sttConfidence < config.sttConfidenceThreshold ||
-                    !job.envelope.payload.sttConfidence.isFinite || !(0...1).contains(job.envelope.payload.sttConfidence) {
+                let sttScore = job.envelope.payload.sttConfidence
+                if !sttScore.isFinite || !(0...1).contains(sttScore) || sttScore < config.sttConfidenceThreshold {
+                    emit(.error(job.envelope.requestId, PipelineError("STT_CONFIDENCE_LOW", stage: "router",
+                        message: "STT \(sttScore), 기준 \(config.sttConfidenceThreshold)")))
+                    await ask(job, question: "말씀하신 내용을 정확히 듣지 못했어요. 다시 말씀해 주세요.")
+                } else if !result.1.missingRequiredSlots.isEmpty {
+                    emit(.error(job.envelope.requestId, PipelineError("MISSING_REQUIRED_SLOTS", stage: "router",
+                        message: result.1.missingRequiredSlots.joined(separator: ", "))))
                     await ask(job, question: "대상과 필요한 내용을 다시 말씀해 주세요.")
                 } else { await dispatchAPI(job, harness: true) }
             case .output:
-                job.output = OutputRequest(requestId: job.envelope.requestId, requiredText: "안녕하세요. 무엇을 도와드릴까요?")
+                let messages = (job.input?.turns ?? []).map { ChatMessage(role: $0.role, content: $0.content) }
+                    + [ChatMessage(role: "user", content: job.envelope.payload.text)]
+                job.output = OutputRequest(requestId: job.envelope.requestId, requiredText: "안녕하세요. 무엇을 도와드릴까요?", messages: messages)
                 await enqueue(job, into: outputQueue)
             case .reminder:
                 if result.1.headOutputs.intention.value == .acknowledgeReminder { acknowledgeReminder() }
@@ -498,25 +556,28 @@ public actor DeskPetPipeline {
             }
         } catch {
             if current(job) {
+                let cause = error as? PipelineError ?? PipelineError("ROUTER_ADAPTER_ERROR", stage: "router", message: String(describing: error))
+                emit(.error(job.envelope.requestId, cause))
                 // Preserve the final user utterance even when inference fails.
                 let input = await context.prepare(job.envelope, resolution: .omitted)
                 job.input = input; job.stamp = await context.commit(job.envelope, input: input, decision: nil)
                 let result = ActionResult(operationId: job.operationId, status: .failed, action: .unclear,
-                                          target: input.activeTarget, error: PipelineError("ROUTER_UNAVAILABLE", stage: "router"))
+                                          target: input.activeTarget, error: PipelineError("ROUTER_UNAVAILABLE", stage: "router",
+                                              message: String("\(cause.code): \(cause.message)".prefix(1_024))))
                 storeAction(job, result)
                 job.output = OutputRequest(requestId: job.envelope.requestId, action: result, requiredText: "요청을 해석하지 못했어요. 다시 말씀해 주세요.")
                 await enqueue(job, into: outputQueue)
             } else { reject(job, error: error) }
         }
     }
-    private func ask(_ original: Job, question: String) async {
+    private func ask(_ original: Job, question: String, harnessResult: ActionResult? = nil) async {
         var job = original
-        let result = ActionResult(operationId: job.operationId, status: .needsClarification,
+        let result = harnessResult ?? ActionResult(operationId: job.operationId, status: .needsClarification,
                                   action: job.decision?.headOutputs.intention.value ?? .unclear, target: job.decision?.resolvedTarget)
         storeAction(job, result)
         if let stamp = job.stamp {
             await context.clarification(job.envelope.conversationId, requestId: job.envelope.requestId,
-                                        slots: job.decision?.missingRequiredSlots ?? [], stamp: stamp)
+                                        slots: job.decision?.missingRequiredSlots ?? [], stamp: stamp, pendingId: result.facts["pendingId"])
         }
         job.output = OutputRequest(requestId: job.envelope.requestId, action: result, requiredText: question, isQuestion: true)
         await enqueue(job, into: outputQueue)
@@ -568,9 +629,18 @@ public actor DeskPetPipeline {
         let start = ContinuousClock.now
         let response: HarnessResult
         do {
-            response = try await perform(token: job.token, timeout: timeout(job, harness ? config.harnessTimeout : config.eurekaTimeout), stage: harness ? "harness" : "eureka") { [job] in
+            response = try await perform(token: job.token, timeout: timeout(job, harness ? config.harnessTimeout : config.eurekaTimeout), stage: harness ? "harness" : "eureka") { [job, adapters] in
                 if let api {
-                    return try await api.run(HarnessRequest(action: request, transcript: job.envelope.payload, context: input))
+                    var call = HarnessRequest(action: request, transcript: job.envelope.payload, context: input)
+                    call.conversationId = job.envelope.conversationId
+                    call.pendingId = input.pendingClarification?.pendingId
+                    call.taskRefs = adapters.taskRefs
+                    let approved = NativeRouterContract.answer(job.envelope.payload.text) == true
+                    // Harness independently validates delivery, scope and the current voice score.
+                    call.mutationApproved = input.pendingClarification?.pendingId != nil && approved
+                        && job.envelope.payload.sttConfidence >= 0.85
+                        && request.decision.overallConfidence >= 0.8
+                    return try await api.run(call)
                 }
                 guard let eureka else { throw CancellationError() }
                 let result = try await eureka.execute(request)
@@ -578,11 +648,13 @@ public actor DeskPetPipeline {
             }
         } catch {
             // Once dispatched, lost mutation replies and cancellation are not confirmed failure.
-            let confirmedFailure = ["EUREKA_AUTH_ERROR", "EUREKA_NOT_FOUND", "EUREKA_CONFLICT", "MCP_AUTH_ERROR", "MCP_TOOL_UNAVAILABLE"].contains((error as? PipelineError)?.code ?? "")
-            let status: ActionStatus = decision.headOutputs.intention.value.isMutation && !confirmedFailure ? .unknown : .failed
+            let cause = error as? PipelineError
+            let notSubmitted = ["KEYBOARD_READ_ONLY", "EUREKA_OPERATION_NOT_IMPLEMENTED"].contains(cause?.code ?? "")
+            let confirmedFailure = notSubmitted || ["EUREKA_AUTH_ERROR", "EUREKA_NOT_FOUND", "EUREKA_CONFLICT", "MCP_AUTH_ERROR", "MCP_TOOL_UNAVAILABLE"].contains(cause?.code ?? "")
+            let status: ActionStatus = (decision.headOutputs.intention.value.isMutation || harness) && !confirmedFailure ? .unknown : .failed
             response = HarnessResult(action: ActionResult(operationId: request.operationId, status: status,
                 action: decision.headOutputs.intention.value, target: decision.resolvedTarget,
-                error: PipelineError(status == .unknown ? (harness ? "MCP_RESULT_UNKNOWN" : "EUREKA_TIMEOUT_RESULT_UNKNOWN") : "ADAPTER_ERROR",
+                error: notSubmitted ? cause : PipelineError(status == .unknown ? (harness ? "MCP_RESULT_UNKNOWN" : "EUREKA_TIMEOUT_RESULT_UNKNOWN") : "ADAPTER_ERROR",
                                      stage: harness ? "harness" : "eureka")))
         }
         progressTimers.removeValue(forKey: job.token)?.cancel()
@@ -625,8 +697,16 @@ public actor DeskPetPipeline {
             reject(job, error: fault); return
         }
         storeAction(job, response.action)
+        if harness, response.action.status == .unknown || response.action.facts["inProgress"] == "true", noticeJobs.count < config.journalCapacity {
+            noticeJobs[job.envelope.requestId] = job
+            if let data = earlyNotices.removeValue(forKey: job.envelope.requestId) {
+                Task { [weak self] in await self?.receiveHarnessNotice(data) }
+            }
+        } else {
+            earlyNotices.removeValue(forKey: job.envelope.requestId)
+        }
         guard current(job) else { finish(job); return }
-        if response.action.status == .needsClarification { await ask(job, question: response.question ?? "어느 대상을 말씀하시나요?"); return }
+        if response.action.status == .needsClarification { await ask(job, question: response.question ?? "어느 대상을 말씀하시나요?", harnessResult: response.action); return }
         await context.clearPending(job.envelope.conversationId)
         let text = factualText(response.action, resultText: response.resultText)
         job.output = OutputRequest(requestId: job.envelope.requestId, action: response.action, requiredText: text)
@@ -643,8 +723,8 @@ public actor DeskPetPipeline {
                 }
                 return "\(name) 변경은 완료됐지만 새 기한 정보는 확인되지 않았어요."
             case .complete: return "\(name) 업무 완료가 확인됐어요."
-            case .register: return "\(name) 업무를 등록했어요."
-            case .updatePriority:
+            case .register, .create: return "\(name) 업무를 등록했어요."
+            case .updatePriority, .setPriority:
                 let labels = ["high": "높음", "normal": "보통", "low": "낮음"]
                 if let value = action.facts["priority"] { return "\(name) 우선순위를 \(labels[value] ?? value)으로 변경했어요." }
                 return "\(name) 우선순위를 변경했어요."
@@ -693,9 +773,15 @@ public actor DeskPetPipeline {
         guard current(job) else { if job.terminal { finish(job) }; return }
         guard text.utf8.count <= config.maxOutputBytes else { reject(job, error: PipelineError("OUTPUT_TOO_LARGE", stage: "output")); return }
         let status = request.action?.status
+        var emotion = status == .succeeded ? "cheerful" : "neutral"
+        if status == nil, !job.isReminder, let classifier = adapters.emotion {
+            let finalText = job.envelope.payload.text
+            emotion = (try? await withTimeout(1, stage: "emotion") { try await classifier.emotion(for: finalText) }) ?? "neutral"
+        }
+        guard current(job) else { return }
         job.event = OutputEvent(requestId: request.requestId, outputId: request.outputId, text: text,
-            emotion: status == .succeeded ? "cheerful" : "neutral", activity: job.terminal ? .speaking : .processing,
-            displayState: status?.rawValue ?? (job.reminder == nil ? "normal" : "reminder"), displayMode: .face,
+            emotion: emotion, activity: job.terminal ? .speaking : .processing,
+            displayState: status?.rawValue ?? (job.isReminder ? "reminder" : "normal"), displayMode: .face,
             displayText: text, speech: SpeechPolicy(), motion: nil, actionStatus: status, reminderKey: request.reminder?.key)
         await fanOut(job)
     }
@@ -838,14 +924,27 @@ public actor DeskPetPipeline {
         state.contextStored = true; state.storingContext = true; deliveries[event.outputId] = state
         defer { deliveries[event.outputId]?.storingContext = false }
         await context.delivered(event, conversation: job.envelope.conversationId,
-                                target: job.reminder?.target ?? job.decision?.resolvedTarget,
-                                stamp: job.stamp, reminder: job.reminder != nil)
+                                target: job.scenarioReminderTarget ?? job.reminder?.target ?? job.decision?.resolvedTarget,
+                                stamp: job.stamp, reminder: job.isReminder)
         guard current(job) else { return }
         if let reminder = job.reminder {
             reminderHistory[reminder.key] = (reminder.dueAt, true, nil); currentReminder = reminder
         }
         quietUntil = Date().addingTimeInterval(config.reminderQuietInterval + (textFallback ? config.textDisplayDuration : 0))
-        if job.output?.isQuestion == true { beginQuestion(job, outputId: event.outputId) }
+        if job.output?.isQuestion == true {
+            if let consumer = adapters.harness as? any HarnessEventConsumer,
+               let facts = job.output?.action?.facts, let pending = facts["pendingId"] {
+                do {
+                    try await consumer.report(HarnessPipelineEvent(requestId: event.requestId, kind: "question_delivered",
+                        pendingId: pending, outputId: facts["outputId"], deliveredText: event.text,
+                        channel: textFallback ? "display" : "speech"))
+                } catch {
+                    emit(.error(event.requestId, PipelineError("QUESTION_DELIVERY_REPORT_FAILED", stage: "harness")))
+                    return
+                }
+            }
+            beginQuestion(job, outputId: event.outputId)
+        }
         if textFallback { beginDisplayTimer() }
     }
     private func finalizeDelivery(_ outputId: UUID) async {
@@ -865,7 +964,7 @@ public actor DeskPetPipeline {
     }
     private func beginQuestion(_ job: Job, outputId: UUID) {
         clearQuestion()
-        waitingQuestion = (job.envelope.conversationId, job.envelope.requestId, outputId)
+        waitingQuestion = (job.envelope.conversationId, job.envelope.requestId, outputId, job.output?.action?.facts["pendingId"])
         emit(.activity(job.envelope.conversationId, .awaitingAnswer))
         questionTimer = Task { [weak self, config] in
             do { try await Task.sleep(for: .seconds(config.questionWait)); await self?.expireQuestion(outputId) } catch {}
@@ -875,6 +974,9 @@ public actor DeskPetPipeline {
     private func expireQuestion(_ output: UUID) async {
         guard let question = waitingQuestion, question.output == output else { return }
         emit(.questionWaitExpired(question.request, output)); clearQuestion()
+        if question.pendingId != nil, let consumer = adapters.harness as? any HarnessEventConsumer {
+            try? await consumer.report(HarnessPipelineEvent(requestId: question.request, kind: "question_wait_expired", pendingId: question.pendingId))
+        }
         await context.clearPending(question.conversation); emit(.activity(question.conversation, .idle))
     }
     private func beginDisplayTimer() {
@@ -891,8 +993,12 @@ public actor DeskPetPipeline {
     public func interact(_ event: InteractionEvent) async {
         switch event {
         case .speechStarted(let conversation):
+            let question = waitingQuestion.flatMap { $0.conversation == conversation ? $0 : nil }
             clearQuestion(); displayTimer?.cancel(); quietUntil = Date().addingTimeInterval(config.reminderQuietInterval)
             await cancelReminder(); emit(.activity(conversation, .listening))
+            if let question, question.pendingId != nil, let consumer = adapters.harness as? any HarnessEventConsumer {
+                try? await consumer.report(HarnessPipelineEvent(requestId: question.request, kind: "speech_started", pendingId: question.pendingId))
+            }
         case .cancel(let conversation): await cancel(conversationId: conversation)
         case .acknowledgeReminder: acknowledgeReminder()
         case .snoozeReminder(let seconds): snoozeReminder(seconds: seconds)
@@ -904,7 +1010,27 @@ public actor DeskPetPipeline {
         reminderHistory[item.key] = (item.dueAt, true, Date().addingTimeInterval(seconds)); currentReminder = nil
     }
     private func cancelReminder() async {
-        for job in active.values where job.reminder != nil { await cancelConversation(job.envelope.conversationId) }
+        for job in active.values where job.isReminder { await cancelConversation(job.envelope.conversationId) }
+    }
+    /// An explicit scenario cue, independent of due-date polling. It has no
+    /// synthetic user turn, model confidence, deadline claim, or API operation.
+    @discardableResult
+    public func startScenarioReminder(target: Target, text: String, conversationId: String = "deskpet") async throws -> UUID {
+        guard running else { throw PipelineError("NOT_RUNNING", stage: "scenario.reminder") }
+        guard active.isEmpty, waitingQuestion == nil else { throw PipelineError("SCENARIO_BUSY", stage: "scenario.reminder") }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= config.maxOutputBytes / 2,
+              conversationId.utf8.count <= 256, target.entityId.utf8.count <= 256, target.name.utf8.count <= 1_024,
+              target.kind.utf8.count <= 64 else { throw PipelineError("INPUT_TOO_LARGE", stage: "scenario.reminder") }
+        let request = UUID(); try reserveRecord(request)
+        var job = Job(envelope: Envelope(requestId: request, conversationId: conversationId,
+            deadlineAt: Date().addingTimeInterval(config.requestTimeout), kind: "scenario.reminder",
+            payload: Transcript(text: "", sttConfidence: 0)))
+        job.scenarioReminderTarget = target
+        job.output = OutputRequest(requestId: request, requiredText: text, isQuestion: true)
+        active[job.token] = job; latest[conversationId] = job.token
+        recordConversations[request] = conversationId
+        await enqueue(job, into: outputQueue)
+        return request
     }
     public func pollReminders(conversationId: String = "deskpet") async {
         guard running, active.isEmpty, waitingQuestion == nil, Date() >= quietUntil,

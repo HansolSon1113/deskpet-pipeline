@@ -2,14 +2,15 @@ import Foundation
 
 /// Connects the existing Harness port to LLM_test's deskpet.harness.v1 server.
 /// Wire mapping follows docs/pipeline-bridge.md; no retry or approval inference.
-public struct ServerHarness: HarnessAdapter {
+public struct ServerHarness: HarnessAdapter, HarnessEventConsumer, HarnessNoticeSource {
+    private let transport: ServerConnection
     private let url: URL
     private let token: String
     public init(url: URL, token: String) throws {
         guard ["ws", "wss"].contains(url.scheme), !token.isEmpty else {
             throw PipelineError("HARNESS_CONFIGURATION", stage: "harness")
         }
-        self.url = url; self.token = token
+        self.url = url; self.token = token; self.transport = ServerConnection(url: url, token: token)
     }
 
     public func run(_ request: HarnessRequest) async throws -> HarnessResult {
@@ -19,68 +20,73 @@ public struct ServerHarness: HarnessAdapter {
             "stamp": ["contextId": input.stamp.contextId.uuidString, "version": input.stamp.version],
             "turns": input.turns.map { ["role": $0.role, "content": $0.content, "turnId": $0.turnId.uuidString] }]
         if let target = input.activeTarget { context["activeTarget"] = try object(target) }
-        let payload: [String: Any] = ["action": try object(request.action), "transcript": try object(request.transcript),
-            "context": context, "conversationId": input.stamp.contextId.uuidString,
+        var payload: [String: Any] = ["action": try object(request.action), "transcript": try object(request.transcript),
+            "context": context, "conversationId": request.conversationId ?? input.stamp.contextId.uuidString,
             "wikiSearchAllowed": request.wikiSearchAllowed, "mutationApproved": request.mutationApproved]
+        if let pending = request.pendingId { context["pendingClarification"] = ["pendingId": pending]; payload["context"] = context }
+        payload["taskRefs"] = try object(request.taskRefs)
+        var action = try wireAction(request.action)
+        var decision = action["decision"] as! [String: Any]
+        if let target = request.action.decision.resolvedTarget, target.kind == "github_pr",
+           let repository = target.repository, let number = target.prNumber {
+            decision["resolvedTarget"] = ["kind": "github_pr", "repository": repository, "prNumber": number]
+        }
+        action["decision"] = decision; payload["action"] = action
         let data = try await call("harness.run", action: request.action, payload: payload, replyKind: "harness.run.result")
         let result = try ContractCodec.decoder().decode(RunReply.self, from: data)
+        if [.succeeded, .failed, .cancelled].contains(result.action.status) { await transport.retire(request.action.requestId) }
         return HarnessResult(action: try result.action.local(request.action), question: result.question, resultText: result.resultText)
     }
 
     public func reconcile(_ request: ActionRequest) async throws -> ActionResult {
-        let data = try await call("harness.reconcile", action: request, payload: object(request), replyKind: "action.result")
+        let data = try await call("harness.reconcile", action: request, payload: wireAction(request), replyKind: "action.result")
         return try ContractCodec.decoder().decode(ActionReply.self, from: data).local(request)
     }
 
     func object<T: Encodable>(_ value: T) throws -> Any {
         try JSONSerialization.jsonObject(with: ContractCodec.encoder().encode(value))
     }
+    func wireAction(_ request: ActionRequest) throws -> [String: Any] {
+        var action = try object(request) as! [String: Any]
+        var decision = action["decision"] as! [String: Any]
+        var heads = decision["headOutputs"] as! [String: Any]
+        var metadata: [String: Any] = [:]
+        // The existing Harness validates headOutputs as {value, confidence}.
+        // Rich native metadata travels in its allowed decision extension.
+        for key in ["spans", "modelConfidence", "generationFinished"] {
+            if let value = heads.removeValue(forKey: key) { metadata[key] = value }
+        }
+        decision["headOutputs"] = heads
+        if !metadata.isEmpty { decision["modelMetadata"] = metadata }
+        action["decision"] = decision
+        return action
+    }
     private func call(_ kind: String, action: ActionRequest, payload: Any, replyKind: String) async throws -> Data {
         try await call(kind, requestId: action.requestId, deadline: action.deadlineAt, payload: payload, replyKind: replyKind)
     }
     func call(_ kind: String, requestId: UUID, deadline: Date, payload: Any, replyKind: String) async throws -> Data {
         let messageId = UUID().uuidString
-        let stage = kind.hasPrefix("eureka.") ? "eureka" : "harness"
         let envelope: [String: Any] = ["schemaVersion": "1.0", "messageId": messageId, "requestId": requestId.uuidString,
             "createdAt": DateCodec.rfc3339(Date()), "deadlineAt": DateCodec.rfc3339(deadline), "kind": kind, "payload": payload]
         let frame = try JSONSerialization.data(withJSONObject: ["type": "request", "envelope": envelope])
-        let hello = try JSONSerialization.data(withJSONObject: ["type": "hello", "token": token, "role": "pipeline", "client": "deskpet-pipeline"])
-        let session = URLSession(configuration: .ephemeral)
-        let socket = session.webSocketTask(with: url); socket.maximumMessageSize = 256_000
-        defer { socket.cancel(with: .normalClosure, reason: nil); session.invalidateAndCancel() }
-        socket.resume()
-        return try await withTimeout(min(30, deadline.timeIntervalSinceNow), stage: stage) {
-            try await withTaskCancellationHandler {
-                try await socket.send(.string(String(decoding: hello, as: UTF8.self)))
-                let welcome = try JSONSerialization.jsonObject(with: await Self.receive(socket)) as? [String: Any]
-                guard welcome?["type"] as? String == "welcome", welcome?["protocol"] as? String == "deskpet.harness.v1",
-                      welcome?["schemaVersion"] as? String == "1.0", welcome?["role"] as? String == "pipeline" else {
-                    throw PipelineError("HARNESS_HANDSHAKE", stage: "harness")
-                }
-                try await socket.send(.string(String(decoding: frame, as: UTF8.self)))
-                let reply = try JSONSerialization.jsonObject(with: await Self.receive(socket)) as? [String: Any]
-                guard reply?["type"] as? String == "reply", reply?["causationId"] as? String == messageId,
-                      reply?["requestId"] as? String == requestId.uuidString else {
-                    throw PipelineError("CORRELATION_MISMATCH", stage: "harness")
-                }
-                guard reply?["ok"] as? Bool == true else {
-                    let code = (reply?["error"] as? [String: Any])?["code"] as? String ?? "HARNESS_SERVER_ERROR"
-                    throw PipelineError(code, stage: "harness")
-                }
-                guard reply?["kind"] as? String == replyKind, let payload = reply?["payload"] else {
-                    throw PipelineError("HARNESS_REPLY_INVALID", stage: "harness")
-                }
-                return try JSONSerialization.data(withJSONObject: payload)
-            } onCancel: { socket.cancel(with: .goingAway, reason: nil) }
-        }
+        return try await transport.request(frame: frame, messageId: messageId, requestId: requestId.uuidString,
+                                            replyKind: replyKind, deadline: deadline)
     }
-    private static func receive(_ socket: URLSessionWebSocketTask) async throws -> Data {
-        switch try await socket.receive() {
-        case .data(let data): return data
-        case .string(let text): return Data(text.utf8)
-        @unknown default: throw PipelineError("HARNESS_REPLY_INVALID", stage: "harness")
-        }
+    public func report(_ event: HarnessPipelineEvent) async throws {
+        var payload: [String: Any] = ["messageId": UUID().uuidString, "requestId": event.requestId.uuidString,
+            "sourceRevision": try await transport.revision(event.requestId), "occurredAt": DateCodec.rfc3339(Date()), "kind": event.kind]
+        if let value = event.pendingId { payload["pendingId"] = value }
+        if let value = event.outputId { payload["outputId"] = value }
+        if let value = event.deliveredText { payload["deliveredText"] = value }
+        if let value = event.channel { payload["channel"] = value }
+        let data = try await call("pipeline.event", requestId: event.requestId, deadline: Date().addingTimeInterval(5), payload: payload, replyKind: "pipeline.event.result")
+        let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard result?["applied"] as? Bool == true else { throw PipelineError("HARNESS_EVENT_REJECTED", stage: "harness") }
+        if ["question_wait_expired", "request_cancelled"].contains(event.kind) { await transport.retire(event.requestId) }
     }
+    public var notices: AsyncStream<Data> { get async { transport.notices } }
+    public func close() async { await transport.close() }
+
 }
 
 private struct RunReply: Decodable { var action: ActionReply; var question: String?; var resultText: String? }

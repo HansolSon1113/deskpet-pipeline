@@ -3,7 +3,24 @@ import DeskPetHardware
 import Foundation
 
 @main struct Demo {
-    static func main() async throws {
+    static func main() async {
+        var status: Int32 = 0
+        do { try await run() }
+        catch is CancellationError { }
+        catch {
+            let text: String
+            if let fault = error as? PipelineError { text = "\(fault.stage): \(fault.code) \(fault.message)\n" }
+            else { text = "\(error)\n" }
+            FileHandle.standardError.write(Data(text.utf8)); status = 1
+        }
+        await NativeConsole.flush()
+        if status != 0 { exit(status) }
+    }
+    static func run() async throws {
+        if CommandLine.arguments.contains("--jetson") { try await JetsonLauncher.run(CommandLine.arguments); return }
+        if CommandLine.arguments.contains("--jetson-native") { try await JetsonLauncher.runNative(CommandLine.arguments); return }
+        if CommandLine.arguments.contains("--project") { try await ProjectLauncher.run(CommandLine.arguments); return }
+        if CommandLine.arguments.contains("--native") { try await NativeDemo.run(CommandLine.arguments); return }
         let connectedDemo = CommandLine.arguments.contains("--connected-demo")
         let moduleDemo = CommandLine.arguments.contains("--module-demo")
         let benchmark = CommandLine.arguments.contains("--benchmark") || moduleDemo

@@ -13,6 +13,18 @@ swift build -c release
 
 Xcode에서 `Package.swift`를 열어 사용할 수 있습니다. macOS에서 빌드·검증했고, Linux/Jetson/Pi 빌드는 아직 검증하지 않았습니다.
 
+## 한 번에 실행
+
+모델과 기존 Harness `.env`가 준비된 상태에서 실행합니다. macOS에서는 `run.command`를 더블클릭해도 됩니다.
+
+```sh
+./run.command
+```
+
+마이크 대신 키보드로 입력하려면 `./run.command --keyboard`를 실행하거나 `run-keyboard.command`를 더블클릭합니다. 문장을 입력한 뒤 Enter로 전송하고 `/quit` 또는 `Ctrl-C`로 종료합니다. STT·VAD 모델은 로드하지 않으며, 기존 리마인드·라우터·Harness·음성 출력은 사용합니다. 키보드 입력은 일반 대화와 조회를 위한 읽기 전용 모드이며 승인·업무 변경은 실행하지 않습니다.
+
+하드웨어 모의 화면과 Harness를 빌드·실행한 뒤 Mac 마이크·스피커를 사용하는 실제 파이프라인을 시작합니다. `Ctrl-C`로 함께 종료합니다. 처음 실행할 때 `Models/native.local.json`을 예제에서 만들며 기존 설정은 유지합니다. 실행 절차와 옵션은 [네이티브 모델 연결](docs/native-models.md)을 참고하세요.
+
 ## 모듈 구조
 
 각 모듈은 모델/API 클라이언트 등의 역할 자원을 소유하고, 작업 제출과 완료 처리를 분리합니다.
@@ -107,6 +119,8 @@ GPU 자원 회수를 기다립니다. 외부 변경의 unknown/confirmed 결과�
 [검증 범위](docs/validation.md)에 실행 결과와 미검증 경계를 기록합니다.
 
 ## 통합 경계
+
+실제 C++/Swift 모델 연결과 TensorRT 교체 경계, 준비·실행 절차는 [네이티브 모델 연결](docs/native-models.md)에 정리되어 있습니다. 기존 mock 실행과 서버 시연은 아래 절차를 그대로 사용합니다.
 
 ### 서버 연결 시연
 

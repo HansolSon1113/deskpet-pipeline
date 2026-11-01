@@ -1,0 +1,24 @@
+{
+  "library": "../.build/native/libdeskpet_inference.so",
+  "harnessEnvFile": "../../LLM_test/.env",
+  "hardwareSocket": "auto",
+  "routeConfidenceThreshold": 0.3,
+  "sttConfidenceThreshold": 0.3,
+  "startupReminder": true,
+  "models": {
+    "router": { "backend": "llama.cpp", "role": "router", "device": "cuda", "paths": { "model": "router/backbone-merged-q4_0.gguf", "heads": "router/heads-f16.gguf", "config": "router/router_config.json", "chat_template": "router/tokenizer/chat_template.jinja" }, "contextTokens": 2560, "maxTokens": 128, "threads": 2 },
+    "output": { "backend": "llama.cpp", "role": "output", "device": "cuda", "paths": { "model": "output/qwen-2b-q4_0.gguf" }, "contextTokens": 2048, "maxTokens": 128, "threads": 2 },
+    "stt": { "backend": "whisper.cpp", "role": "stt", "device": "cpu", "paths": { "model": "stt/ggml-small-q8_0.bin" }, "contextTokens": 0, "maxTokens": 0, "threads": 4 },
+    "vad": { "backend": "sherpa-onnx", "role": "vad", "device": "cpu", "paths": { "model": "vad/silero_vad.onnx" }, "contextTokens": 0, "maxTokens": 0, "threads": 1 },
+    "emotion": { "backend": "onnxruntime", "role": "emotion", "device": "cpu", "paths": { "model": "emotion/model.onnx", "tokenizer": "emotion/tokenizer.json" }, "contextTokens": 0, "maxTokens": 0, "threads": 2 },
+    "tts": { "backend": "sherpa-onnx", "role": "tts", "device": "cpu", "paths": {
+      "duration_predictor": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/duration_predictor.int8.onnx",
+      "text_encoder": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/text_encoder.int8.onnx",
+      "vector_estimator": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vector_estimator.int8.onnx",
+      "vocoder": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vocoder.int8.onnx",
+      "tts_json": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/tts.json",
+      "unicode_indexer": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/unicode_indexer.bin",
+      "voice_style": "tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/voice.bin"
+    }, "contextTokens": 0, "maxTokens": 0, "threads": 2 }
+  }
+}

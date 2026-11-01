@@ -357,12 +357,19 @@ classDiagram
   class HeadOutputs {
     <<struct>>
     +intention
+    +modelIntention : Head~ModelIntention~?
+    +operation : Head~String?~?
     +target
     +name
+    +checkpoint
     +dueAt
     +priority
     +task
     +note
+    +spans : Dictionary~String, ModelSpan~?
+    +modelConfidence : Double?
+    +generationFinished : Dictionary~String, Bool~?
+    +modelOperation : RouterOperation?
   }
   class DecisionComposer {
     <<enum>>

@@ -1,15 +1,20 @@
 import Foundation
 import DeskPetHardware
 
-public struct HardwareMicrophone: MicrophoneSource {
+public struct HardwareMicrophone: MicrophoneSource, AudioInputEpochValidator {
+    private let client: HardwareClient
     private let source: HardwareMicrophoneSource
-    public init(client: HardwareClient) { source = HardwareMicrophoneSource(client: client) }
+    public init(client: HardwareClient) { self.client = client; source = HardwareMicrophoneSource(client: client) }
+    public func isCurrent(_ inputEpoch: UInt64) -> Bool {
+        guard let epoch = Int64(exactly: inputEpoch) else { return false }
+        return client.isCurrentInputEpoch(epoch)
+    }
     public func start() async throws { try await source.start() }
     public func stop() async throws { try await source.stop() }
     public func nextFrame() async throws -> AudioFrame? {
         guard let frame = try await source.nextFrame() else { return nil }
         return AudioFrame(chunk: PCMChunk(data: frame.chunk.data, sampleRate: frame.chunk.sampleRate,
-                                         channels: frame.chunk.channels), timestamp: frame.timestamp)
+                                         channels: frame.chunk.channels), timestamp: frame.timestamp, inputEpoch: UInt64(exactly: frame.inputEpoch))
     }
 }
 

@@ -3,14 +3,24 @@ import Foundation
 /// Direct Eureka port, separate from Harness. Uses the server's existing EurekaBridge.
 public struct ServerEureka: EurekaAdapter {
     private let connection: ServerHarness
+    public init(connection: ServerHarness) { self.connection = connection }
     public init(url: URL, token: String) throws { connection = try ServerHarness(url: url, token: token) }
 
     public func execute(_ request: ActionRequest) async throws -> ActionResult { try await action("eureka.execute", request) }
     public func reconcile(_ request: ActionRequest) async throws -> ActionResult { try await action("eureka.reconcile", request) }
     private func action(_ kind: String, _ request: ActionRequest) async throws -> ActionResult {
-        var payload = try connection.object(request) as! [String: Any]
+        var payload = try connection.wireAction(request)
         var decision = payload["decision"] as! [String: Any]
-        if let target = request.decision.resolvedTarget {
+        // Only these historical wire aliases differ from the canonical labels.
+        // Every other Operation is passed through, even if its executor is absent.
+        var wireHeads = decision["headOutputs"] as! [String: Any]
+        let intent = request.decision.headOutputs.intention.value
+        let legacy: Intent? = intent == .create ? .register : intent == .setPriority ? .updatePriority : nil
+        if let legacy {
+            wireHeads["intention"] = ["value": legacy.rawValue, "confidence": request.decision.headOutputs.intention.confidence]
+        }
+        decision["headOutputs"] = wireHeads
+        if let target = request.decision.resolvedTarget, ["item", "eureka_item"].contains(target.kind) {
             decision["resolvedTarget"] = ["kind": "eureka_item", "itemId": target.entityId]
             // A targeted Swift query corresponds to the server's status read (P-12).
             if request.decision.headOutputs.intention.value == .query {
@@ -18,6 +28,8 @@ public struct ServerEureka: EurekaAdapter {
                 heads["intention"] = ["value": "eureka.status", "confidence": request.decision.headOutputs.intention.confidence]
                 decision["headOutputs"] = heads
             }
+        } else {
+            decision.removeValue(forKey: "resolvedTarget")
         }
         payload["decision"] = decision
         let data = try await connection.call(kind, requestId: request.requestId, deadline: request.deadlineAt,

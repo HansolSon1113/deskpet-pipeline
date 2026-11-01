@@ -3,7 +3,10 @@ import Foundation
 // The runtime provides a nonblocking completion probe. It owns stream/context details.
 public struct GPUCompletion<Value: Sendable>: Sendable {
     public let poll: @Sendable () -> Result<Value, any Error>?
-    public init(poll: @escaping @Sendable () -> Result<Value, any Error>?) { self.poll = poll }
+    public let cancel: @Sendable () -> Void
+    public init(cancel: @escaping @Sendable () -> Void = {}, poll: @escaping @Sendable () -> Result<Value, any Error>?) {
+        self.cancel = cancel; self.poll = poll
+    }
 }
 public struct GPUOperation<Value: Sendable>: Sendable {
     public let submit: @Sendable () throws -> GPUCompletion<Value>
@@ -39,6 +42,7 @@ private final class GPUWork<Value: Sendable>: @unchecked Sendable {
         catch { resolve(.failure(error)); return false }
     }
     func poll() -> Bool {
+        if lock.withLock({ cancelled }) { completion?.cancel() }
         guard let result = completion?.poll() else { return false }
         resolve(result); completion = nil; return true
     }
