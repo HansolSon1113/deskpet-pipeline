@@ -66,8 +66,6 @@ public protocol DisplayAdapter: Sendable {
     func show(_ event: OutputEvent) async throws
     func idle() async throws
 }
-/// Optional direct state delivery; correctness must not depend on the lossy diagnostic stream.
-public protocol ActivityDisplayAdapter: DisplayAdapter { func activity(_ state: Activity) async throws }
 public protocol WebConsumer: Sendable { func publish(_ event: OutputEvent) async throws }
 public protocol RemoteRouter: Sendable { func heads(for input: RouterInput, deadlineAt: Date) async throws -> HeadOutputs }
 public struct Adapters: Sendable {

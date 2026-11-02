@@ -337,20 +337,8 @@ public struct AudioSegment: Sendable {
         self.pcm = pcm; self.startedAt = startedAt; self.endedAt = endedAt
     }
 }
-public struct TouchInput: Sendable {
-    public var phase: String
-    public var contactId: String
-    public var x: Double
-    public var y: Double
-    public var timestamp: Date
-    public var simulated: Bool
-    public init(phase: String, contactId: String, x: Double, y: Double, timestamp: Date, simulated: Bool) {
-        self.phase = phase; self.contactId = contactId; self.x = x; self.y = y; self.timestamp = timestamp; self.simulated = simulated
-    }
-}
-public enum InteractionEvent: Sendable { case speechStarted(String), cancel(String), acknowledgeReminder, snoozeReminder(TimeInterval), touch(TouchInput) }
+public enum InteractionEvent: Sendable { case speechStarted(String), cancel(String), acknowledgeReminder, snoozeReminder(TimeInterval) }
 public enum PipelineEvent: Sendable {
-    case touch(TouchInput)
     case partial(Envelope<Transcript>), accepted(UUID), routed(UUID, RouteDecision)
     case transcriptFinal(Envelope<Transcript>)
     case action(UUID, ActionResult), output(OutputEvent), delivery(DeliveryResult)
