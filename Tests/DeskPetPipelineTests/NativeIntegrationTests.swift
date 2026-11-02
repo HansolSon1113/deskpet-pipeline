@@ -38,6 +38,8 @@ private func waitForIdle(_ pipeline: DeskPetPipeline) async throws {
     #expect(shortMessages.first?.role == "system")
     #expect(shortMessages.first?.content == NativeOutputModel.shortOutputPrompt)
     #expect(shortMessages.last == userMessages.first)
+    let rawSpeech = "**재료(1인분)**: *스파게티 면*, 올리브유(3큰술), 마늘 (5쪽)을 준비합니다.\n- 면을 삶습니다 (약 8분(중불)).\n- 마늘을 볶아 완성합니다!"
+    #expect(NativeOutputModel.sanitizeForSpeech(rawSpeech) == "재료: 스파게티 면, 올리브유, 마늘을 준비합니다. 면을 삶습니다. 마늘을 볶아 완성합니다!")
     let shortOutputModel = NativeOutputModel(model: model, executor: executor, shortOutput: true)
     let question = OutputRequest(requestId: UUID(), requiredText: "PR 1번을 승인할까요?", isQuestion: true, messages: [.init(role: "user", content: "바꿔 말해줘")])
     #expect(try await output.generate(question) == question.requiredText)

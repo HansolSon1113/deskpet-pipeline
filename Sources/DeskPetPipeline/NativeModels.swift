@@ -146,7 +146,11 @@ private final class NativeInferenceJob: @unchecked Sendable {
 
 public struct NativeOutputModel: OutputModel {
     public static let shortOutputPrompt = """
-    당신은 데스크펫 음성 비서입니다. 긴 글을 그대로 작성하거나 장황하게 나열하지 말고, 마크다운 기호 없이 자연스러운 한국어 평문으로 간결하게 답하세요. 설명, 방법, 레시피 등 글 작성이 필요한 요청에는 핵심 항목(예: 필요한 재료나 준비물)만 간단히 언급하고 과정이나 핵심 내용을 5~6문장 정도로 짧게 요약해서 끝맺으세요.
+    당신은 데스크펫 음성 비서입니다. 응답은 곧바로 TTS 음성으로 읽히므로 다음 규칙을 반드시 지키세요.
+    1. 별표(*, **), 밑줄(_), 샵(#), 하이픈(-), 백틱(`) 등 강조 기호나 마크다운 서식을 절대 사용하지 마세요.
+    2. 소괄호(())나 대괄호([])를 사용한 부가 서술, 부연 설명, 병기를 절대 쓰지 마세요. 꼭 필요한 내용은 괄호 없이 문장으로 자연스럽게 풀어 쓰거나 생략하세요.
+    3. 번호 매기기나 글머리 기호 목록 대신 소리 내어 읽기 자연스러운 한국어 평문 문장으로 이어서 답하세요.
+    4. 설명, 방법, 레시피 등 글 작성이 필요한 요청에는 핵심 항목(예: 필요한 재료나 준비물)만 간단히 언급하고 과정이나 핵심 내용을 5~6문장 정도로 짧게 요약해서 끝맺으세요.
     """
     public let model: NativeInferenceModel
     public let executor: GPUExecutor
@@ -161,13 +165,28 @@ public struct NativeOutputModel: OutputModel {
         if messages.first?.role == "system" { return messages }
         return [ChatMessage(role: "system", content: shortOutputPrompt)] + messages
     }
+    public static func sanitizeForSpeech(_ text: String) -> String {
+        var output = text
+        for pattern in ["[ \\t]*\\([^()]*\\)", "[ \\t]*（[^（）]*）", "[ \\t]*\\[[^\\[\\]]*\\]"] {
+            while let range = output.range(of: pattern, options: .regularExpression) {
+                output.removeSubrange(range)
+            }
+        }
+        output = output.replacingOccurrences(of: "(?m)^\\s*[-•+]\\s+", with: "", options: .regularExpression)
+        let forbidden = CharacterSet(charactersIn: "*_`~#()（）[]")
+        output = String(output.unicodeScalars.filter { !forbidden.contains($0) })
+        output = output.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        output = output.replacingOccurrences(of: "\\s+([,.!?:;])", with: "$1", options: .regularExpression)
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? text : trimmed
+    }
     public func generate(_ request: OutputRequest) async throws -> String {
         guard request.action == nil, request.reminder == nil, !request.isQuestion, !request.messages.isEmpty else { return request.requiredText }
         struct Reply: Decodable, Sendable { var text: String }
         struct Input: Encodable, Sendable { var messages: [ChatMessage] }
         let messages = Self.preparedMessages(for: request.messages, shortOutput: shortOutput)
         let result = try await model.gpu(Input(messages: messages), executor: executor, as: Reply.self)
-        return result.text
+        return shortOutput ? Self.sanitizeForSpeech(result.text) : result.text
     }
 }
 
