@@ -30,6 +30,12 @@ playground.xcworkspace
 # .swiftpm
 
 .build/
+Models/**
+!Models/*.example.json
+!Models/README.md
+.DS_Store
+.env
+out/
 
 # CocoaPods
 #
@@ -60,3 +66,4 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+Models.zip

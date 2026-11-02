@@ -36,6 +36,22 @@ public extension HarnessAdapter {
     }
 }
 public protocol OutputModel: Sendable { func generate(_ request: OutputRequest) async throws -> String }
+public protocol EmotionClassifier: Sendable { func emotion(for text: String) async throws -> String }
+public struct HarnessPipelineEvent: Sendable {
+    public var requestId: UUID
+    public var kind: String
+    public var pendingId: String?
+    public var outputId: String?
+    public var deliveredText: String?
+    public var channel: String?
+    public init(requestId: UUID, kind: String, pendingId: String? = nil, outputId: String? = nil,
+                deliveredText: String? = nil, channel: String? = nil) {
+        self.requestId = requestId; self.kind = kind; self.pendingId = pendingId; self.outputId = outputId
+        self.deliveredText = deliveredText; self.channel = channel
+    }
+}
+public protocol HarnessEventConsumer: Sendable { func report(_ event: HarnessPipelineEvent) async throws }
+public protocol HarnessNoticeSource: Sendable { var notices: AsyncStream<Data> { get async } }
 // Pulling one chunk at a time bounds PCM memory. finish returns only after physical playback.
 public protocol AudioSource: Sendable { func nextChunk() async throws -> PCMChunk? }
 public protocol SpeechSynthesizer: Sendable { func audio(for event: OutputEvent) async throws -> any AudioSource }
@@ -56,7 +72,7 @@ public protocol WebConsumer: Sendable { func publish(_ event: OutputEvent) async
 public protocol RemoteRouter: Sendable { func heads(for input: RouterInput, deadlineAt: Date) async throws -> HeadOutputs }
 public struct Adapters: Sendable {
     public var stt: any SpeechRecognizer
-    public var router: any RouterModel
+    public var router: (any RouterModel)?
     public var eureka: any EurekaAdapter
     public var harness: any HarnessAdapter
     public var output: any OutputModel
@@ -66,7 +82,10 @@ public struct Adapters: Sendable {
     public var web: (any WebConsumer)?
     public var remoteRouter: (any RemoteRouter)?
     public var gpuExecutor: GPUExecutor?
-    public init(stt: any SpeechRecognizer, router: any RouterModel, eureka: any EurekaAdapter,
+    public var emotion: (any EmotionClassifier)?
+    public var inputEpochValidator: (any AudioInputEpochValidator)?
+    public var taskRefs: [HarnessTaskRef] = []
+    public init(stt: any SpeechRecognizer, router: (any RouterModel)? = nil, eureka: any EurekaAdapter,
                 harness: any HarnessAdapter, output: any OutputModel, tts: any SpeechSynthesizer,
                 speaker: any SpeakerAdapter, display: any DisplayAdapter,
                 web: (any WebConsumer)? = nil, remoteRouter: (any RemoteRouter)? = nil,

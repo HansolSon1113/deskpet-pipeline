@@ -1,6 +1,15 @@
 import Foundation
 
+public enum RoutingMode: String, Sendable, Codable {
+    case model
+    case directLLM = "direct-llm"
+}
+
 public struct PipelineConfiguration: Sendable {
+    public var routingMode: RoutingMode = .model
+    /// Explicit terminal input is accepted at confidence 1 by user choice.
+    /// Learned head/modelConfidence values remain unchanged.
+    public var confirmedTextInput = false
     public var queueCapacity = 16
     public var audioQueueCapacity = 2
     public var streamingFrameQueueCapacity = 64

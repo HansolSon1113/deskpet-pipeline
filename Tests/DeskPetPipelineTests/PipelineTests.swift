@@ -341,6 +341,7 @@ extension PipelineTests {
         await pipeline.start(automaticReminders: false)
         let id = try await send(pipeline, "요청"); try await idle(pipeline)
         #expect(await pipeline.record(requestId: id)?.action?.status == .failed)
+        #expect(await pipeline.record(requestId: id)?.action?.error?.message.contains("INFERENCE_ERROR") == true)
         #expect(await pipeline.contextTurns(conversationId: "deskpet").first?.content == "요청")
         await pipeline.shutdown()
     }

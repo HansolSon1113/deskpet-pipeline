@@ -1,5 +1,8 @@
 // swift-tools-version: 6.0
 import PackageDescription
+import Foundation
+
+let demoInfo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("native/DeskPetDemo-Info.plist").path
 
 let package = Package(
     name: "DeskPetPipeline",

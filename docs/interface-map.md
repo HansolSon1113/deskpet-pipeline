@@ -1,5 +1,11 @@
 # Wiki 계약 대응표
 
+## Router model binding — 2026-11-01
+
+I-05·I-06의 실제 모델 필드 계약은 [router-model-contract.md](router-model-contract.md)로 최신화했다. `modelIntention`과 `operation`은 모델의 실제 출력이고, Eureka 실행 의도는 24개 Operation 모두 `eureka.<Operation>`으로 연결한다. 미구현 Operation을 `llm`으로 바꾸지 않는다. Name은 단계, Task는 업무 이름/요약이며 Span 원문·좌표·실제 Confidence를 유지한다. PR 대상은 Eureka 업무 ID로 전달하지 않는다. 구형 `eureka.register`·`eureka.priority` 이름은 ServerEureka wire 경계의 호환 별칭이며 원본 Operation을 덮어쓰지 않는다. Harness 구현과 정책은 이번 변경 범위에 포함하지 않는다.
+
+## Earlier interface map
+
 기준: `$VAULT_DIR/wiki/deskpet-interface-contracts.md` (updated: 2026-09-29),
 `deskpet-technology-stack.md`, `small-router-model.md`, `eureka-process.md`, `deskpet-poc-validation.md`.
 Wiki의 제안 타입/timeout을 구현 시작점으로 채택했습니다. 사용자 요청에 따라 I-06/I-07의 API 실행은 별도 큐 없이 직접 비동기 호출하며, 경로별 동시 실행 한도로 과부하를 제한합니다. 미확정 hardware enum과 실제 서버 response schema는 확정하지 않았습니다.

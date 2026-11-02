@@ -15,6 +15,7 @@ public struct PendingClarification: Sendable {
     public var requestId: UUID
     public var slots: [String]
     public var expiresAt: Date
+    public var pendingId: String?
 }
 public struct RouterInput: Sendable {
     public var transcript: Transcript
@@ -25,7 +26,7 @@ public struct RouterInput: Sendable {
     public var contextDescription: String
     public var turnId: UUID
     public var requestId: UUID
-    // Real adapters apply their tokenizer's chat template to roles and contextDescription.
+    // Only role messages enter the learned model; contextDescription is code state.
 }
 struct RouteRecord: Sendable { var turnId: UUID; var decision: RouteDecision }
 actor RouterContextStore {
@@ -75,6 +76,12 @@ actor RouterContextStore {
         guard var value = states[envelope.conversationId], value.id == input.stamp.contextId,
               value.version == input.stamp.version else { return nil }
         guard !value.turns.contains(where: { $0.turnId == envelope.turnId }) else { return nil }
+        if decision?.headOutputs.modelIntention?.value == .eureka, value.target?.kind == "github_pr" {
+            // A PR reminder is not an Eureka item identity. Start the new domain
+            // with the current user turn, retaining no unrelated PR pending.
+            value.target = decision?.resolvedTarget
+            value.turns.removeAll(); value.history.removeAll(); value.pending = nil
+        }
         value.turns.append(ContextTurn(role: "user", content: envelope.payload.text, turnId: envelope.turnId,
                                        requestId: envelope.requestId, outputId: nil))
         if let decision { value.history.append(RouteRecord(turnId: envelope.turnId, decision: decision)) }
@@ -82,9 +89,9 @@ actor RouterContextStore {
         states[envelope.conversationId] = value
         return ContextStamp(contextId: value.id, version: value.version)
     }
-    func clarification(_ conversation: String, requestId: UUID, slots: [String], stamp: ContextStamp) {
+    func clarification(_ conversation: String, requestId: UUID, slots: [String], stamp: ContextStamp, pendingId: String? = nil) {
         guard var value = states[conversation], value.id == stamp.contextId else { return }
-        value.pending = PendingClarification(requestId: requestId, slots: slots, expiresAt: Date().addingTimeInterval(config.contextExpiry))
+        value.pending = PendingClarification(requestId: requestId, slots: slots, expiresAt: Date().addingTimeInterval(config.contextExpiry), pendingId: pendingId)
         states[conversation] = value
     }
     func clearPending(_ conversation: String) {
@@ -118,19 +125,28 @@ public enum DecisionComposer {
     public static func compose(_ heads: HeadOutputs, confidence: Double, input: RouterInput,
                                resolution: TargetResolution, threshold: Double, sttThreshold: Double) -> RouteDecision {
         let intent = heads.intention.value
-        let target: Target? = { switch resolution { case .unique(let target): return target
+        let operation = heads.modelIntention?.value == .eureka ? heads.modelOperation : nil
+        let candidate: Target? = { switch resolution { case .unique(let target): return target
             case .omitted: return input.activeTarget; case .ambiguous: return nil } }()
+        let target = operation != nil && candidate?.kind == "github_pr" ? nil : candidate
+        let hasTargetSpan = operation != nil && heads.target.value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         var missing: [String] = []
-        if [.query, .complete, .postpone, .updatePriority].contains(intent), target == nil { missing.append("target") }
+        let needsTarget = operation != nil ? [.complete, .postpone, .setPriority].contains(intent) : [.query, .complete, .postpone, .updatePriority].contains(intent)
+        if needsTarget, target == nil, !hasTargetSpan { missing.append("target") }
         if intent == .register, heads.name.value?.isEmpty != false { missing.append("name") }
+        let needsTask = operation == .create || operation == .addTask
+        if needsTask, heads.task.value?.isEmpty != false { missing.append("task") }
         if intent == .postpone, heads.dueAt.value == nil { missing.append("dueAt") }
-        if intent == .updatePriority, heads.priority.value == nil { missing.append("priority") }
+        if [.updatePriority, .setPriority].contains(intent), heads.priority.value == nil { missing.append("priority") }
         if intent == .mcp, heads.task.value?.isEmpty != false { missing.append("task") }
-        if case .ambiguous = resolution { missing.append("uniqueTarget") }
-        let requiredScores = [heads.intention.confidence] + (target == nil ? [] : [heads.target.confidence]) +
+        let globalQuery = operation.map { [RouterOperation.queryProcesses, .queryActors, .queryWorkspace].contains($0) } ?? false
+        if case .ambiguous = resolution, !globalQuery { missing.append("uniqueTarget") }
+        let requiredScores = [heads.intention.confidence] + (operation == nil ? [] : [heads.operation?.confidence ?? 0]) +
+            ((target != nil || hasTargetSpan) && needsTarget ? [heads.target.confidence] : []) +
             (intent == .postpone ? [heads.dueAt.confidence] : []) +
             (intent == .register ? [heads.name.confidence] : []) +
-            (intent == .updatePriority ? [heads.priority.confidence] : []) +
+            (needsTask ? [heads.task.confidence] : []) +
+            ([.updatePriority, .setPriority].contains(intent) ? [heads.priority.confidence] : []) +
             (intent == .mcp ? [heads.task.confidence] : [])
         let reliable = ([confidence] + requiredScores).allSatisfy { $0.isFinite && $0 >= threshold && $0 <= 1 }
         let sttReliable = input.transcript.sttConfidence.isFinite && input.transcript.sttConfidence >= sttThreshold && input.transcript.sttConfidence <= 1
@@ -138,12 +154,15 @@ public enum DecisionComposer {
         if !reliable || !sttReliable || !missing.isEmpty || intent == .unclear { route = .harness }
         else if intent == .chat { route = .output }
         else if [.acknowledgeReminder, .snoozeReminder].contains(intent) { route = .reminder }
-        else if intent == .mcp { route = .harness }
+        else if [.mcp, .reviewPR, .approvePR, .summarizePR, .confirmApprove, .confirmReject, .harnessTask].contains(intent) { route = .harness }
         else { route = .eureka }
         return RouteDecision(headOutputs: heads, overallConfidence: confidence, missingRequiredSlots: missing,
                              route: route, sourceTurnIds: input.turns.map(\.turnId) + [input.turnId], resolvedTarget: target)
     }
     public static func mask(_ heads: HeadOutputs) -> HeadOutputs {
+        // A trained multihead result already applies its Intention mask before
+        // Confidence. Preserve its operation/span/generator semantics verbatim.
+        if heads.modelIntention != nil { return heads }
         var result = heads
         let intent = heads.intention.value
         if ![.postpone, .register].contains(intent) { result.dueAt = Head(nil, confidence: 1) }

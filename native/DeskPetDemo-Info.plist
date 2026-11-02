@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.deskpet.pipeline.demo</string>
+<key>CFBundleName</key><string>DeskPet</string>
+<key>NSMicrophoneUsageDescription</key><string>DeskPet이 한국어 음성 요청과 승인 답변을 인식합니다.</string>
+</dict></plist>

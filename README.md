@@ -15,6 +15,20 @@ swift build -c release
 
 Xcode에서 `Package.swift`를 열어 사용할 수 있습니다. macOS에서 빌드·검증했고, Linux/Jetson/Pi 빌드는 아직 검증하지 않았습니다.
 
+## 한 번에 실행
+
+모델과 기존 Harness `.env`가 준비된 상태에서 실행합니다. macOS에서는 `run.command`를 더블클릭해도 됩니다.
+
+```sh
+./run.command
+```
+
+마이크 대신 키보드로 입력하려면 `./run.command --keyboard`를 실행하거나 `run-keyboard.command`를 더블클릭합니다. 문장을 입력한 뒤 Enter로 전송하고 `/quit` 또는 `Ctrl-C`로 종료합니다. STT·VAD 모델은 로드하지 않으며, 기존 리마인드·라우터·Harness·음성 출력은 사용합니다. 키보드에서도 승인·업무 변경을 전달하며 확정 입력 신뢰도는 1입니다. 읽기만 실행하려면 `--read-only`를 명시합니다.
+
+`./run.command --keyboard --direct-llm`은 라우터를 로드하지 않고 기존 Harness의 Gemini로 바로 전달합니다. 모델별 시간과 프로세스 메모리는 실행마다 `.build/performance/` 아래 CSV로 기록합니다. 옵션과 측정 범위는 [모델 성능 기록](docs/model-performance.md)을 참고하세요.
+
+하드웨어 모의 화면과 Harness를 빌드·실행한 뒤 Mac 마이크·스피커를 사용하는 실제 파이프라인을 시작합니다. `Ctrl-C`로 함께 종료합니다. 처음 실행할 때 `Models/native.local.json`을 예제에서 만들며 기존 설정은 유지합니다. 실행 절차와 옵션은 [네이티브 모델 연결](docs/native-models.md)을 참고하세요.
+
 ## 모듈 구조
 
 각 모듈은 모델/API 클라이언트 등의 역할 자원을 소유하고, 작업 제출과 완료 처리를 분리합니다.
@@ -39,6 +53,9 @@ GPU는 하나의 전담 OS 스레드가 연산 제출·완료 확인·결과 반
 모델은 각 모듈에 남으며 실제 GPU 호출은 `MockGPUCall`입니다. TensorRT/CUDA 의존성이나 자체 GPU 병렬
 스케줄러는 없습니다. 실제 런타임이 비동기 연산과 완료 handle을 제공하는 경계만 정의했습니다.
 [모듈 및 GPU 설계](docs/concurrency-design.md)에 책임과 연결 방식을 정리했습니다.
+
+[클래스 다이어그램](docs/class-diagrams.md)은 전체 소유권, 공통 모듈, 담당자별 통합 protocol과
+GPU 실행 경계를 현재 코드 기준으로 표현합니다. 모듈 통합 시 이 문서의 역할별 타입 표와 공개 인터페이스를 참고합니다.
 
 ## 사용 예
 
@@ -106,6 +123,28 @@ GPU 자원 회수를 기다립니다. 외부 변경의 unknown/confirmed 결과�
 [검증 범위](docs/validation.md)에 실행 결과와 미검증 경계를 기록합니다.
 
 ## 통합 경계
+
+실제 C++/Swift 모델 연결과 TensorRT 교체 경계, 준비·실행 절차는 [네이티브 모델 연결](docs/native-models.md)에 정리되어 있습니다. 기존 mock 실행과 서버 시연은 아래 절차를 그대로 사용합니다.
+
+### 서버 연결 시연
+
+형제 폴더의 `LLM_test`에서 `pnpm web:fixture`를 실행하고 켜 둡니다. 서버 기본 주소는
+`ws://127.0.0.1:8788`입니다. 이 저장소에서는 다음 명령을 실행합니다.
+
+```sh
+swift run deskpet-demo --connected-demo
+```
+
+Mock 발화 `보고서 제출 상태 알려줘` → Eureka 업무 조회, `DeskPet PR 42 리뷰해줘` → Harness PR 리뷰가
+Swift pipeline의 실제 서버 adapter를 통해 처리되고, 서버 결과와 최종 발화가 터미널에 표시됩니다.
+두 작업의 성공과 출력 완료를 확인하면 `pipeline 출력 완료 2/2`를 출력합니다. 서버 미가동·인증 실패·
+업무 실패를 성공으로 표시하지 않습니다. STT/라우터/출력 모델/TTS/장치와 외부 업무 데이터는 mock/fixture입니다.
+
+`--connected-demo`에서만 fixture 주소·전용 토큰을 기본값으로 사용합니다.
+다른 서버는 `HARNESS_WS_URL`·`HARNESS_WS_TOKEN`으로 지정합니다. 두 저장소에서 동시에 서버를
+새로 실행하지 않으며, `EADDRINUSE`가 나면 기존 서버가 같은 포트를 사용 중인지 확인합니다.
+시연은 하드웨어 서버 없이 실행합니다. `DESKPET_SERVER_TESTS=1 swift test`로 두 adapter의
+pipeline 연결 회귀를 확인할 수 있습니다.
 
 [계약 대응표](docs/interface-map.md)에 I-01~I-23 연결 지점을 정리했습니다.
 `Adapters.gpuMocks(executor:)`는 라우터·출력 모델의 GPU 호출을 mock 처리합니다. 실제 모델·추론 런타임,

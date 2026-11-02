@@ -34,9 +34,84 @@ public enum Intent: String, Sendable, Codable {
     case register = "eureka.register", query = "eureka.query", complete = "eureka.complete"
     case postpone = "eureka.postpone", updatePriority = "eureka.priority"
     case mcp = "mcp.task", chat = "chat", unclear = "unclear"
+    case reviewPR = "pr.review", approvePR = "pr.approve", summarizePR = "pr.summary"
+    case confirmApprove = "confirm.approve", confirmReject = "confirm.reject", harnessTask = "llm"
     case acknowledgeReminder = "reminder.acknowledge", snoozeReminder = "reminder.snooze"
-    public var isMutation: Bool { [.register, .complete, .postpone, .updatePriority, .mcp].contains(self) }
+    // Native executions use the exact Operation label after the eureka prefix.
+    // register/priority remain aliases for existing adapters and mock callers.
+    case create = "eureka.create", updateStage = "eureka.update_stage"
+    case setPriority = "eureka.update_priority", updateItem = "eureka.update_item"
+    case hold = "eureka.hold", resume = "eureka.resume", delete = "eureka.delete"
+    case startStage = "eureka.start_stage", resetStage = "eureka.reset_stage", skipStage = "eureka.skip_stage"
+    case completeTask = "eureka.complete_task"
+    case queryProcesses = "eureka.query_processes", queryActors = "eureka.query_actors", queryWorkspace = "eureka.query_workspace"
+    case addStage = "eureka.add_stage", deleteStage = "eureka.delete_stage", deleteTask = "eureka.delete_task"
+    case addTask = "eureka.add_task", addNote = "eureka.add_note"
+    case moveStageUp = "eureka.move_stage_up", moveStageDown = "eureka.move_stage_down"
+    public var eurekaOperation: RouterOperation? {
+        if self == .register { return .create }
+        if self == .updatePriority { return .updatePriority }
+        guard rawValue.hasPrefix("eureka.") else { return nil }
+        return RouterOperation(rawValue: String(rawValue.dropFirst("eureka.".count)))
+    }
+    public var isMutation: Bool {
+        if let operation = eurekaOperation { return operation.isMutation }
+        return [.mcp, .approvePR].contains(self)
+    }
 }
+
+/// The training model's 24 labels, independent of execution availability.
+public enum RouterOperation: String, Sendable, Codable, CaseIterable {
+    case create, query, complete
+    case updateStage = "update_stage", postpone, updatePriority = "update_priority", updateItem = "update_item"
+    case hold, resume, delete
+    case startStage = "start_stage", resetStage = "reset_stage", skipStage = "skip_stage", completeTask = "complete_task"
+    case queryProcesses = "query_processes", queryActors = "query_actors", queryWorkspace = "query_workspace"
+    case addStage = "add_stage", deleteStage = "delete_stage", deleteTask = "delete_task"
+    case addTask = "add_task", addNote = "add_note", moveStageUp = "move_stage_up", moveStageDown = "move_stage_down"
+    public var executionIntent: Intent {
+        switch self {
+        case .create: return .create
+        case .query: return .query
+        case .complete: return .complete
+        case .updateStage: return .updateStage
+        case .postpone: return .postpone
+        case .updatePriority: return .setPriority
+        case .updateItem: return .updateItem
+        case .hold: return .hold
+        case .resume: return .resume
+        case .delete: return .delete
+        case .startStage: return .startStage
+        case .resetStage: return .resetStage
+        case .skipStage: return .skipStage
+        case .completeTask: return .completeTask
+        case .queryProcesses: return .queryProcesses
+        case .queryActors: return .queryActors
+        case .queryWorkspace: return .queryWorkspace
+        case .addStage: return .addStage
+        case .deleteStage: return .deleteStage
+        case .deleteTask: return .deleteTask
+        case .addTask: return .addTask
+        case .addNote: return .addNote
+        case .moveStageUp: return .moveStageUp
+        case .moveStageDown: return .moveStageDown
+        }
+    }
+    public var isMutation: Bool {
+        ![.query, .queryProcesses, .queryActors, .queryWorkspace].contains(self)
+    }
+}
+public struct ModelSpan: Sendable, Codable, Equatable {
+    public var message: Int
+    /// Unicode scalar offsets, matching the training checkpoint's Python character offsets.
+    public var start: Int
+    public var end: Int
+    public var text: String
+    public init(message: Int, start: Int, end: Int, text: String) {
+        self.message = message; self.start = start; self.end = end; self.text = text
+    }
+}
+public enum ModelIntention: String, Sendable, Codable { case eureka, llm, talk, unclear }
 public struct Head<Value: Sendable & Codable>: Sendable, Codable {
     public var value: Value
     public var confidence: Double
@@ -50,6 +125,16 @@ public struct HeadOutputs: Sendable, Codable {
     public var priority: Head<String?>
     public var task: Head<String?>
     public var note: Head<String?>
+    public var modelIntention: Head<ModelIntention>?
+    public var operation: Head<String?>?
+    public var checkpoint: Head<String?>?
+    public var spans: [String: ModelSpan]?
+    public var modelConfidence: Double?
+    public var generationFinished: [String: Bool]?
+    public var modelOperation: RouterOperation? {
+        guard let label = operation?.value else { return nil }
+        return RouterOperation(rawValue: label)
+    }
     public init(intent: Intent, name: String? = nil, dueAt: Date? = nil, priority: String? = nil,
                 task: String? = nil, note: String? = nil, confidence: Double = 0.99) {
         intention = Head(intent, confidence: confidence); target = Head(name == nil ? nil : "item")
@@ -61,14 +146,21 @@ public struct Target: Sendable, Codable, Equatable {
     public var kind: String
     public var entityId: String
     public var name: String
-    public init(kind: String = "item", entityId: String, name: String) {
+    public var repository: [String: String]?
+    public var prNumber: Int?
+    public init(kind: String = "item", entityId: String, name: String,
+                repository: [String: String]? = nil, prNumber: Int? = nil) {
         self.kind = kind; self.entityId = entityId; self.name = name
+        self.repository = repository; self.prNumber = prNumber
     }
     public func isSameEntity(as other: Target) -> Bool { kind == other.kind && entityId == other.entityId }
 }
 public enum TargetResolution: Sendable { case omitted, unique(Target), ambiguous }
 public enum Route: String, Sendable, Codable { case eureka, harness, output, reminder }
 public struct RouteDecision: Sendable, Codable {
+    /// Explicit transport selection, separate from a learned model prediction.
+    public var routingMode: RoutingMode? = nil
+    public var confidenceSource: String? = nil
     public var headOutputs: HeadOutputs
     public var overallConfidence: Double
     public var missingRequiredSlots: [String]
@@ -124,6 +216,30 @@ public struct HarnessRequest: Sendable {
     public var wikiSearchAllowed = true
     // A real harness must enforce approval before mutation tools.
     public var mutationApproved = false
+    public var conversationId: String?
+    public var pendingId: String?
+    public var taskRefs: [HarnessTaskRef] = []
+}
+public struct HarnessTaskRef: Sendable, Codable {
+    public struct Source: Sendable, Codable {
+        public var kind: String
+        public var ref: String
+        public init(kind: String, ref: String) { self.kind = kind; self.ref = ref }
+    }
+    public var itemId: String
+    public var stageId: String
+    public var repository: [String: String]
+    public var prNumber: Int
+    public var source: Source
+    public init(itemId: String, stageId: String, repository: [String: String], prNumber: Int, source: Source? = nil) {
+        self.itemId = itemId; self.stageId = stageId; self.repository = repository; self.prNumber = prNumber
+        self.source = source ?? Source(kind: "eureka", ref: "item:\(itemId)/stage:\(stageId)")
+    }
+}
+public struct ChatMessage: Sendable, Codable, Equatable {
+    public var role: String
+    public var content: String
+    public init(role: String, content: String) { self.role = role; self.content = content }
 }
 public struct HarnessResult: Sendable {
     public var action: ActionResult
@@ -155,10 +271,12 @@ public struct OutputRequest: Sendable {
     public var reminder: ReminderItem?
     public var requiredText: String
     public var isQuestion = false
+    public var messages: [ChatMessage] = []
     public init(outputId: UUID = UUID(), requestId: UUID, action: ActionResult? = nil,
-                reminder: ReminderItem? = nil, requiredText: String, isQuestion: Bool = false) {
+                reminder: ReminderItem? = nil, requiredText: String, isQuestion: Bool = false, messages: [ChatMessage] = []) {
         self.outputId = outputId; self.requestId = requestId; self.action = action
         self.reminder = reminder; self.requiredText = requiredText; self.isQuestion = isQuestion
+        self.messages = messages
     }
 }
 public enum Activity: String, Sendable, Codable { case idle, listening, processing, speaking; case awaitingAnswer = "awaiting_answer" }
@@ -234,6 +352,7 @@ public enum InteractionEvent: Sendable { case speechStarted(String), cancel(Stri
 public enum PipelineEvent: Sendable {
     case touch(TouchInput)
     case partial(Envelope<Transcript>), accepted(UUID), routed(UUID, RouteDecision)
+    case transcriptFinal(Envelope<Transcript>)
     case action(UUID, ActionResult), output(OutputEvent), delivery(DeliveryResult)
     case error(UUID?, PipelineError), activity(String, Activity), questionWaitExpired(UUID, UUID)
 }
