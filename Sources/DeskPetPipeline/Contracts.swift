@@ -158,6 +158,9 @@ public struct Target: Sendable, Codable, Equatable {
 public enum TargetResolution: Sendable { case omitted, unique(Target), ambiguous }
 public enum Route: String, Sendable, Codable { case eureka, harness, output, reminder }
 public struct RouteDecision: Sendable, Codable {
+    /// Explicit transport selection, separate from a learned model prediction.
+    public var routingMode: RoutingMode? = nil
+    public var confidenceSource: String? = nil
     public var headOutputs: HeadOutputs
     public var overallConfidence: Double
     public var missingRequiredSlots: [String]

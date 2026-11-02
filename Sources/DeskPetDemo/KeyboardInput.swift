@@ -13,19 +13,6 @@ struct KeyboardOnlyRecognizer: SpeechRecognizer {
     }
 }
 
-struct KeyboardReadOnlyEureka: EurekaAdapter {
-    let base: any EurekaAdapter
-    func execute(_ request: ActionRequest) async throws -> ActionResult {
-        guard !request.decision.headOutputs.intention.value.isMutation else {
-            throw PipelineError("KEYBOARD_READ_ONLY", stage: "input.keyboard", message: "키보드 입력은 읽기 전용입니다.")
-        }
-        return try await base.execute(request)
-    }
-    func reconcile(_ request: ActionRequest) async throws -> ActionResult { try await base.reconcile(request) }
-    func reminders() async throws -> [ReminderItem] { try await base.reminders() }
-    func reminder(itemId: String) async throws -> ReminderItem? { try await base.reminder(itemId: itemId) }
-}
-
 /// Reads stdin on a dispatch queue so waiting for Enter does not block Swift tasks.
 /// The queue owns the partial UTF-8 buffer; stream and cancellation are thread safe.
 private final class KeyboardLineInput: @unchecked Sendable {
@@ -93,7 +80,7 @@ extension NativeDemo {
                 if !text.isEmpty {
                     await pipeline.interact(.speechStarted("native-demo"))
                     _ = try await pipeline.submit(Envelope(conversationId: "native-demo", kind: "stt.final",
-                        payload: Transcript(text: text, sttConfidence: 0)))
+                        payload: Transcript(text: text, sttConfidence: 1)))
                     while await pipeline.inFlightCount() > 0 { try await Task.sleep(for: .milliseconds(20)) }
                 }
                 await NativeConsole.flush()

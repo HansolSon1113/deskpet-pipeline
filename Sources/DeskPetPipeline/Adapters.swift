@@ -70,7 +70,7 @@ public protocol WebConsumer: Sendable { func publish(_ event: OutputEvent) async
 public protocol RemoteRouter: Sendable { func heads(for input: RouterInput, deadlineAt: Date) async throws -> HeadOutputs }
 public struct Adapters: Sendable {
     public var stt: any SpeechRecognizer
-    public var router: any RouterModel
+    public var router: (any RouterModel)?
     public var eureka: any EurekaAdapter
     public var harness: any HarnessAdapter
     public var output: any OutputModel
@@ -83,7 +83,7 @@ public struct Adapters: Sendable {
     public var emotion: (any EmotionClassifier)?
     public var inputEpochValidator: (any AudioInputEpochValidator)?
     public var taskRefs: [HarnessTaskRef] = []
-    public init(stt: any SpeechRecognizer, router: any RouterModel, eureka: any EurekaAdapter,
+    public init(stt: any SpeechRecognizer, router: (any RouterModel)? = nil, eureka: any EurekaAdapter,
                 harness: any HarnessAdapter, output: any OutputModel, tts: any SpeechSynthesizer,
                 speaker: any SpeakerAdapter, display: any DisplayAdapter,
                 web: (any WebConsumer)? = nil, remoteRouter: (any RemoteRouter)? = nil,

@@ -51,7 +51,7 @@ C++와 Swift 공통 바인딩은 같은 라벨을 사용한다. Swift는 구형 
 | `move_stage_up` | `eureka.move_stage_up` |
 | `move_stage_down` | `eureka.move_stage_down` |
 
-`query`, `query_processes`, `query_actors`, `query_workspace`는 조회이며 나머지는 변경 동작으로 분류한다. 기존 키보드 읽기 전용 제한·확인·권한·신뢰도 정책을 완화하지 않는다.
+`query`, `query_processes`, `query_actors`, `query_workspace`는 조회이며 나머지는 변경 동작으로 분류한다. 사용자 지시에 따라 키보드 읽기 전용 차단을 제거하고 확정 입력·전달용 신뢰도를 1로 설정한다. 모델의 원본 head·modelConfidence는 유지하며 업무 확인과 권한 처리는 기존 계약을 따른다.
 
 ## Dispatch and adapter boundary
 
@@ -60,7 +60,7 @@ C++와 Swift 공통 바인딩은 같은 라벨을 사용한다. Swift는 구형 
 - 전역 조회는 업무/단계 ID를 요구하지 않는다. native `create`·`add_task`의 생성 이름은 Task로 받으며 구형 register의 Name 규칙을 적용하지 않는다. 모델의 Target 원문과 이미 확인된 업무 ID는 서로 다른 정보다. 미해결 원문을 PR ID 등으로 대체하지 않고 실행 Adapter에 원래 head와 함께 전달한다.
 - Eureka 결과에 이전 PR 리마인드의 `github_pr` 대상을 업무 ID로 재사용하지 않는다. PR→Eureka 전환 시 관련 없는 PR pending과 이전 대화 묶음을 해제한다. 이 변경은 원래 모델 입력을 다른 말로 바꾸거나 재추론하는 기능이 아니다.
 - ServerEureka의 구형 wire 호환 이름만 `eureka.create`→`eureka.register`, `eureka.update_priority`→`eureka.priority`로 변환한다. 원본 `modelIntention`·`operation`·Span·점수는 그대로 전달한다. 업무 ID가 실제로 확인된 `query`만 기존 status 조회 이름으로 연결한다. 나머지 Operation은 canonical 이름 그대로 전달한다.
-- 호출 전의 명시적인 `KEYBOARD_READ_ONLY`·`EUREKA_OPERATION_NOT_IMPLEMENTED`는 확정 실패이며, 외부 요청 응답 유실의 `unknown`과 구분한다. 결과 불명 쓰기는 기존 계약대로 재전송하지 않는다.
+- 호출 전의 명시적인 `EUREKA_OPERATION_NOT_IMPLEMENTED`는 확정 실패이며, 외부 요청 응답 유실의 `unknown`과 구분한다. 결과 불명 쓰기는 기존 계약대로 재전송하지 않는다.
 
 ## Console
 

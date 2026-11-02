@@ -6,14 +6,19 @@ public struct ServerHarness: HarnessAdapter, HarnessEventConsumer, HarnessNotice
     private let transport: ServerConnection
     private let url: URL
     private let token: String
-    public init(url: URL, token: String) throws {
+    private let performance: ModelPerformance?
+    public init(url: URL, token: String, performance: ModelPerformance? = nil) throws {
         guard ["ws", "wss"].contains(url.scheme), !token.isEmpty else {
             throw PipelineError("HARNESS_CONFIGURATION", stage: "harness")
         }
         self.url = url; self.token = token; self.transport = ServerConnection(url: url, token: token)
+        self.performance = performance
     }
 
     public func run(_ request: HarnessRequest) async throws -> HarnessResult {
+        let span = performance?.begin(role: "harness", backend: "remote-llm", device: "remote", phase: "roundtrip")
+        var completed = false
+        defer { performance?.end(span, status: completed ? "ok" : Task.isCancelled ? "cancelled" : "failed") }
         let input = request.context
         var context: [String: Any] = ["requestId": input.requestId.uuidString, "turnId": input.turnId.uuidString,
             "transcript": try object(input.transcript),
@@ -35,7 +40,9 @@ public struct ServerHarness: HarnessAdapter, HarnessEventConsumer, HarnessNotice
         let data = try await call("harness.run", action: request.action, payload: payload, replyKind: "harness.run.result")
         let result = try ContractCodec.decoder().decode(RunReply.self, from: data)
         if [.succeeded, .failed, .cancelled].contains(result.action.status) { await transport.retire(request.action.requestId) }
-        return HarnessResult(action: try result.action.local(request.action), question: result.question, resultText: result.resultText)
+        let response = HarnessResult(action: try result.action.local(request.action), question: result.question, resultText: result.resultText)
+        completed = true
+        return response
     }
 
     public func reconcile(_ request: ActionRequest) async throws -> ActionResult {

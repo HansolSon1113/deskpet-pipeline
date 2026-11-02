@@ -46,19 +46,22 @@ enum JetsonLauncher {
     static func run(_ arguments: [String]) async throws {
         let options = Array(arguments.drop(while: { $0 != "--jetson" }).dropFirst())
         if options.contains("--help") {
-            print("./run-linux.sh [--keyboard] [--real-hardware] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
+            print("./run-linux.sh [--keyboard] [--direct-llm] [--metrics-dir DIR] [--real-hardware] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
             print("Linux / Jetson Orin Nano용 진입점입니다. --real-hardware 지정 시 ALSA/I2C 드라이버 및 config/jetson.json을 사용합니다.")
             return
         }
         var customConfig: String?
+        var metricsDirectory: String?
         var i = 0
         while i < options.count {
-            if options[i] == "--config" {
+            if options[i] == "--config" || options[i] == "--metrics-dir" {
                 guard i + 1 < options.count, !options[i + 1].hasPrefix("--") else {
-                    throw fault("CONFIG_REQUIRED", "--config 뒤에 파일 경로를 지정하세요.")
+                    throw fault("CONFIG_REQUIRED", "\(options[i]) 뒤에 경로를 지정하세요.")
                 }
-                customConfig = options[i + 1]; i += 2
-            } else if ["--keyboard", "--no-build", "--check", "--headless", "--read-only", "--real-hardware"].contains(options[i]) {
+                if options[i] == "--config" { customConfig = options[i + 1] }
+                else { metricsDirectory = options[i + 1] }
+                i += 2
+            } else if ["--keyboard", "--direct-llm", "--no-build", "--check", "--headless", "--read-only", "--real-hardware"].contains(options[i]) {
                 i += 1
             } else {
                 throw fault("UNKNOWN_OPTION", options[i])
@@ -88,12 +91,14 @@ enum JetsonLauncher {
         for key in ["HARNESS_WS_TOKEN", "GITHUB_TEST_REPO", "GITHUB_TEST_PR"] {
             guard environment[key]?.isEmpty == false else { throw fault("CONFIGURATION_MISSING", "기존 Harness .env에 \(key)을 설정하세요.") }
         }
-        if !options.contains("--read-only"), !options.contains("--keyboard"), environment["DESKPET_STORE_PATH"]?.isEmpty != false {
+        if !options.contains("--read-only"), environment["DESKPET_STORE_PATH"]?.isEmpty != false {
             throw fault("STORE_REQUIRED", "쓰기 실행에는 기존 .env의 DESKPET_STORE_PATH가 필요합니다.")
         }
 
         let keyboard = options.contains("--keyboard")
-        let roles = keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"]
+        let directLLM = (config.directLLM ?? false) || options.contains("--direct-llm")
+        let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
+            .filter { !directLLM || $0 != "router" }
         for role in roles {
             guard let model = config.models[role], model.role == role else { throw fault("MODEL_CONFIGURATION_MISSING", role) }
             for path in model.paths.values where !files.fileExists(atPath: resolve(path)) {
@@ -215,7 +220,7 @@ enum JetsonLauncher {
             }
 
             var serverArgs = ["node", "--import", "tsx", "scripts/server.ts"]
-            if !options.contains("--read-only"), !keyboard { serverArgs += ["--allow-github-writes", "--allow-eureka-writes"] }
+            if !options.contains("--read-only") { serverArgs += ["--allow-github-writes", "--allow-eureka-writes"] }
             if await welcomed(serverURL, token: environment["HARNESS_WS_TOKEN"]!) {
                 throw fault("HARNESS_ALREADY_RUNNING", "이미 Harness가 실행 중입니다. 기존 서버를 종료한 뒤 다시 실행하세요: \(serverURL.absoluteString)")
             }
@@ -228,12 +233,14 @@ enum JetsonLauncher {
                 if await welcomed(serverURL, token: environment["HARNESS_WS_TOKEN"]!), server.isRunning { break }
                 try await Task.sleep(for: .milliseconds(100))
             }
-            print(keyboard ? "Harness 준비 완료. 키보드 입력은 읽기 전용입니다." : "Harness 준비 완료. 실제 변경은 별도 확인 후 실행됩니다.")
             let instruction = keyboard ? "문장을 입력하고 Enter를 누르세요. 종료: /quit 또는 Ctrl-C" : "마이크에 말씀하세요. 종료: Ctrl-C"
             print("실행 로그: \(logs.path)\n\(instruction)")
 
             let keyboardPipe = keyboard ? Pipe() : nil
-            let pipeline = try start("pipeline", [URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path, "--jetson-native", configURL.path, keyboard ? "--keyboard" : "--live"], directory: root, console: true, input: keyboardPipe?.fileHandleForReading ?? FileHandle.nullDevice)
+            var pipelineArgs = [URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path, "--jetson-native", configURL.path, keyboard ? "--keyboard" : "--live"]
+            if directLLM { pipelineArgs.append("--direct-llm") }
+            if let metricsDirectory { pipelineArgs += ["--metrics-dir", URL(fileURLWithPath: metricsDirectory).standardizedFileURL.path] }
+            let pipeline = try start("pipeline", pipelineArgs, directory: root, console: true, input: keyboardPipe?.fileHandleForReading ?? FileHandle.nullDevice)
             try? keyboardPipe?.fileHandleForReading.close()
             let keyboardRelay: DispatchSourceRead? = keyboardPipe.map { pipe in
                 let source = DispatchSource.makeReadSource(fileDescriptor: STDIN_FILENO, queue: DispatchQueue(label: "deskpet.jetson.stdin"))
@@ -279,6 +286,13 @@ enum JetsonLauncher {
             path.hasPrefix("/") ? path : root.appendingPathComponent(path).standardizedFileURL.path
         }
         let config = try JSONDecoder().decode(NativeDemo.Configuration.self, from: Data(contentsOf: configURL))
+        let directLLM = (config.directLLM ?? false) || arguments.contains("--direct-llm")
+        let keyboard = arguments.contains("--keyboard")
+        let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
+            .filter { !directLLM || $0 != "router" }
+        let performance = try NativeDemo.performanceRecorder(config: config, arguments: arguments, configURL: configURL,
+                                                            roles: roles, directLLM: directLLM)
+        defer { performance.close() }
         let library = try NativeBackendLibrary(path: resolve(config.library))
         var libraries: [String: NativeBackendLibrary] = [resolve(config.library): library]
         let gpu = try GPUExecutor()
@@ -288,7 +302,7 @@ enum JetsonLauncher {
             let path = resolve(c.library ?? config.library)
             if libraries[path] == nil { libraries[path] = try NativeBackendLibrary(path: path) }
             c.library = nil
-            return try NativeInferenceModel(library: libraries[path]!, configuration: c)
+            return try NativeInferenceModel(library: libraries[path]!, configuration: c, performance: performance)
         }
         if arguments.contains("--probe-cpu") {
             for role in ["stt", "vad", "emotion", "tts"] { _ = try model(role); print("CPU 모델 준비: \(role)") }
@@ -300,9 +314,7 @@ enum JetsonLauncher {
             print(result); await gpu.shutdown(); return
         }
 
-        let keyboard = arguments.contains("--keyboard")
         var loaded: [String: NativeInferenceModel] = [:]
-        let roles = keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"]
         for role in roles { loaded[role] = try model(role); print("모델 준비: \(role)") }
         if arguments.contains("--probe") { await gpu.shutdown(); print("모델 \(loaded.count)개 로드 완료"); return }
 
@@ -316,15 +328,14 @@ enum JetsonLauncher {
         }
         let repository = ["owner": String(repo[0]), "name": String(repo[1])]
         let target = Target(kind: "github_pr", entityId: "\(repo.joined(separator: "/"))#\(number)", name: "PR \(number)", repository: repository, prNumber: number)
-        let harness = try ServerHarness(url: url, token: token)
+        let harness = try ServerHarness(url: url, token: token, performance: performance)
         let recognizer: any SpeechRecognizer = keyboard ? KeyboardOnlyRecognizer() : NativeStreamingSTT(model: loaded["stt"]!)
         var adapters = Adapters(stt: recognizer,
-            router: NativeRouterModel(model: loaded["router"]!, executor: gpu, configuredTarget: target),
+            router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target) },
             eureka: ServerEureka(connection: harness), harness: harness,
             output: NativeOutputModel(model: loaded["output"]!, executor: gpu),
             tts: NativeSpeechSynthesizer(model: loaded["tts"]!), speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
-        if keyboard { adapters.eureka = KeyboardReadOnlyEureka(base: adapters.eureka) }
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
             adapters.taskRefs = [HarnessTaskRef(itemId: item, stageId: stage, repository: repository, prNumber: number)]
         }
@@ -361,14 +372,14 @@ enum JetsonLauncher {
         defer { hardware?.close(); hardwareEvents?.cancel() }
 
         var timing = PipelineConfiguration()
+        timing.routingMode = directLLM ? .directLLM : .model
+        timing.confirmedTextInput = keyboard || arguments.contains("--text")
         timing.routerTimeout = config.routerTimeout ?? 15; timing.outputTimeout = config.outputTimeout ?? 15
         timing.sttTimeout = config.sttTimeout ?? 15; timing.ttsFirstChunkTimeout = config.ttsTimeout ?? 10
         timing.routeConfidenceThreshold = config.routeConfidenceThreshold ?? 0.3
-        timing.sttConfidenceThreshold = keyboard ? 0 : config.sttConfidenceThreshold ?? 0.3
+        timing.sttConfidenceThreshold = config.sttConfidenceThreshold ?? 0.3
         timing.requestTimeout = 120
         let pipeline = try DeskPetPipeline(adapters: adapters, configuration: timing)
-        if keyboard { print("라우팅 신뢰도 기준: \(timing.routeConfidenceThreshold); 키보드 진단 입력은 읽기 전용입니다.") }
-        else { print("신뢰도 기준: 라우팅 \(timing.routeConfidenceThreshold), STT \(timing.sttConfidenceThreshold)") }
         await pipeline.start(automaticReminders: false)
         let logger = Task {
             for await event in pipeline.events {
@@ -394,8 +405,7 @@ enum JetsonLauncher {
         }
         do {
             if let i = arguments.firstIndex(of: "--text"), arguments.count > i + 1 {
-                print("텍스트 진단: 실제 음성 승인을 대신하지 않습니다.")
-                _ = try await pipeline.submit(Envelope(conversationId: "native-demo", kind: "stt.final", payload: Transcript(text: arguments[i + 1], sttConfidence: 0)))
+                _ = try await pipeline.submit(Envelope(conversationId: "native-demo", kind: "stt.final", payload: Transcript(text: arguments[i + 1], sttConfidence: 1)))
                 while await pipeline.inFlightCount() > 0 { try await Task.sleep(for: .milliseconds(10)) }
             } else if keyboard {
                 try await NativeDemo.keyboardSession(pipeline: pipeline, target: target,

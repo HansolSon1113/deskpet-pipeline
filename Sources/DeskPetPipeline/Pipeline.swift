@@ -89,6 +89,9 @@ public actor DeskPetPipeline {
     private var speechSessions: [UUID: Job] = [:]
 
     public init(adapters: Adapters, configuration: PipelineConfiguration = .init()) throws {
+        guard configuration.routingMode == .directLLM || adapters.router != nil else {
+            throw PipelineError("ROUTER_REQUIRED", stage: "startup")
+        }
         try configuration.validate(); config = configuration; self.adapters = adapters
         context = RouterContextStore(configuration)
         sttQueue = Mailbox(capacity: max(configuration.audioQueueCapacity, configuration.streamingFrameQueueCapacity))
@@ -236,7 +239,8 @@ public actor DeskPetPipeline {
         if let pending, records[pending]?.action?.status == .needsClarification {
             let target = await context.activeTarget(envelope.conversationId)
             let resolution = try await withTimeout(config.routerTimeout, stage: "clarification.target") { [adapters, original] in
-                try await adapters.router.resolveTarget(in: original.payload)
+                guard let router = adapters.router else { return TargetResolution.omitted }
+                return try await router.resolveTarget(in: original.payload)
             }
             preResolved = resolution
             let switchesTarget: Bool
@@ -478,8 +482,24 @@ public actor DeskPetPipeline {
         guard current(job) else { if job.terminal { finish(job) }; return }
         do { try await queue.offer(job) } catch { reject(job, error: error) }
     }
-    private func inferRoute(_ original: Job, model: any RouterModel) async throws -> (RouterInput, RouteDecision) {
+    private func inferRoute(_ original: Job, model: (any RouterModel)?) async throws -> (RouterInput, RouteDecision) {
         guard current(original) else { throw CancellationError() }
+        if config.routingMode == .directLLM {
+            let input = await context.prepare(original.envelope, resolution: .omitted)
+            // This is a configured destination, not a classifier prediction.
+            // User-selected direct delivery has routing confidence 1. This is
+            // configuration, not a learned head/modelConfidence measurement.
+            var heads = HeadOutputs(intent: .harnessTask, confidence: 1)
+            heads.target = Head(nil, confidence: 1); heads.name = Head(nil, confidence: 1)
+            heads.dueAt = Head(nil, confidence: 1); heads.priority = Head(nil, confidence: 1)
+            heads.task = Head(nil, confidence: 1); heads.note = Head(nil, confidence: 1)
+            var decision = RouteDecision(headOutputs: heads, overallConfidence: 1, missingRequiredSlots: [],
+                route: .harness, sourceTurnIds: input.turns.map(\.turnId) + [input.turnId], resolvedTarget: input.activeTarget)
+            decision.routingMode = .directLLM
+            decision.confidenceSource = "configured-direct-llm"
+            return (input, decision)
+        }
+        guard let model else { throw PipelineError("ROUTER_REQUIRED", stage: "router") }
         let job = original
         let start = ContinuousClock.now
         defer { Task { [metrics] in await metrics.record("router", since: start) } }
@@ -516,8 +536,13 @@ public actor DeskPetPipeline {
                 let score = try await withTimeout(config.routerTimeout, stage: "router.confidence") {
                     try await model.confidence(for: masked, missingSlots: provisional.missingRequiredSlots)
                 }
-                return (input, DecisionComposer.compose(heads, confidence: score, input: input, resolution: resolution,
-                                                       threshold: config.routeConfidenceThreshold, sttThreshold: config.sttConfidenceThreshold))
+                var decision = DecisionComposer.compose(heads, confidence: score, input: input, resolution: resolution,
+                                                       threshold: config.routeConfidenceThreshold, sttThreshold: config.sttConfidenceThreshold)
+                if config.confirmedTextInput {
+                    decision.overallConfidence = 1
+                    decision.confidenceSource = "confirmed-keyboard-input"
+                }
+                return (input, decision)
             }
     }
     private func routed(_ original: Job, result outcome: Result<(RouterInput, RouteDecision), any Error>) async {
@@ -636,10 +661,8 @@ public actor DeskPetPipeline {
                     call.pendingId = input.pendingClarification?.pendingId
                     call.taskRefs = adapters.taskRefs
                     let approved = NativeRouterContract.answer(job.envelope.payload.text) == true
-                    // Harness independently validates delivery, scope and the current voice score.
+                    // Forward the explicit answer; Harness owns confirmation handling.
                     call.mutationApproved = input.pendingClarification?.pendingId != nil && approved
-                        && job.envelope.payload.sttConfidence >= 0.85
-                        && request.decision.overallConfidence >= 0.8
                     return try await api.run(call)
                 }
                 guard let eureka else { throw CancellationError() }
@@ -649,7 +672,7 @@ public actor DeskPetPipeline {
         } catch {
             // Once dispatched, lost mutation replies and cancellation are not confirmed failure.
             let cause = error as? PipelineError
-            let notSubmitted = ["KEYBOARD_READ_ONLY", "EUREKA_OPERATION_NOT_IMPLEMENTED"].contains(cause?.code ?? "")
+            let notSubmitted = ["EUREKA_OPERATION_NOT_IMPLEMENTED"].contains(cause?.code ?? "")
             let confirmedFailure = notSubmitted || ["EUREKA_AUTH_ERROR", "EUREKA_NOT_FOUND", "EUREKA_CONFLICT", "MCP_AUTH_ERROR", "MCP_TOOL_UNAVAILABLE"].contains(cause?.code ?? "")
             let status: ActionStatus = (decision.headOutputs.intention.value.isMutation || harness) && !confirmedFailure ? .unknown : .failed
             response = HarnessResult(action: ActionResult(operationId: request.operationId, status: status,

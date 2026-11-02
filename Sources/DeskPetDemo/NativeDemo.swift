@@ -18,6 +18,8 @@ struct NativeDemo {
         var routeConfidenceThreshold: Double?
         var sttConfidenceThreshold: Double?
         var routerContextEnabled: Bool?
+        var directLLM: Bool?
+        var performanceDirectory: String?
         var startupReminder: Bool?
         var startupReminderText: String?
     }
@@ -44,6 +46,13 @@ struct NativeDemo {
         }
         let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: configURL))
         let routerContextEnabled = (config.routerContextEnabled ?? true) && !arguments.contains("--no-router-context")
+        let directLLM = (config.directLLM ?? false) || arguments.contains("--direct-llm")
+        let keyboard = arguments.contains("--keyboard")
+        let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
+            .filter { !directLLM || $0 != "router" }
+        let performance = try performanceRecorder(config: config, arguments: arguments, configURL: configURL,
+                                                roles: roles, directLLM: directLLM)
+        defer { performance.close() }
         let library = try NativeBackendLibrary(path: resolve(config.library))
         var libraries: [String: NativeBackendLibrary] = [resolve(config.library): library]
         let gpu = try GPUExecutor()
@@ -53,7 +62,7 @@ struct NativeDemo {
             let path = resolve(c.library ?? config.library)
             if libraries[path] == nil { libraries[path] = try NativeBackendLibrary(path: path) }
             c.library = nil
-            return try NativeInferenceModel(library: libraries[path]!, configuration: c)
+            return try NativeInferenceModel(library: libraries[path]!, configuration: c, performance: performance)
         }
         if let flag = arguments.firstIndex(of: "--evaluate-router"), arguments.count > flag+1 {
             func argument(_ name: String) throws -> String {
@@ -113,9 +122,7 @@ struct NativeDemo {
             _ = try await NativeOutputModel(model: output, executor: gpu).generate(OutputRequest(requestId: UUID(), requiredText: "", messages: [ChatMessage(role: "user", content: arguments[say+1])]))
             await gpu.shutdown(); return
         }
-        let keyboard = arguments.contains("--keyboard")
         var loaded: [String: NativeInferenceModel] = [:]
-        let roles = keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"]
         for role in roles { loaded[role] = try model(role) }
         if arguments.contains("--probe") { await gpu.shutdown(); return }
         let env = try environment(config.harnessEnvFile.map(resolve))
@@ -128,17 +135,16 @@ struct NativeDemo {
         }
         let repository = ["owner": String(repo[0]), "name": String(repo[1])]
         let target = Target(kind: "github_pr", entityId: "\(repo.joined(separator: "/"))#\(number)", name: "PR \(number)", repository: repository, prNumber: number)
-        let harness = try ServerHarness(url: url, token: token)
+        let harness = try ServerHarness(url: url, token: token, performance: performance)
         let recognizer: any SpeechRecognizer
         if keyboard { recognizer = KeyboardOnlyRecognizer() }
         else { recognizer = NativeStreamingSTT(model: loaded["stt"]!) }
         var adapters = Adapters(stt: recognizer,
-            router: NativeRouterModel(model: loaded["router"]!, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled),
+            router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
             output: NativeOutputModel(model: loaded["output"]!, executor: gpu),
             tts: NativeSpeechSynthesizer(model: loaded["tts"]!), speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
-        if keyboard { adapters.eureka = KeyboardReadOnlyEureka(base: adapters.eureka) }
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
             adapters.taskRefs = [HarnessTaskRef(itemId: item, stageId: stage, repository: repository, prNumber: number)]
         }
@@ -160,12 +166,12 @@ struct NativeDemo {
         }
         #endif
         var timing = PipelineConfiguration()
+        timing.routingMode = directLLM ? .directLLM : .model
+        timing.confirmedTextInput = keyboard || arguments.contains("--text")
         timing.routerTimeout = config.routerTimeout ?? 15; timing.outputTimeout = config.outputTimeout ?? 15
         timing.sttTimeout = config.sttTimeout ?? 15; timing.ttsFirstChunkTimeout = config.ttsTimeout ?? 10
         timing.routeConfidenceThreshold = config.routeConfidenceThreshold ?? 0.3
-        // Text diagnostics have no recognized speech; their zero score never
-        // satisfies the unchanged approval gates. External writes are disabled.
-        timing.sttConfidenceThreshold = keyboard ? 0 : config.sttConfidenceThreshold ?? 0.3
+        timing.sttConfidenceThreshold = config.sttConfidenceThreshold ?? 0.3
         timing.requestTimeout = 120
         let pipeline = try DeskPetPipeline(adapters: adapters, configuration: timing)
         await pipeline.start(automaticReminders: false)
@@ -187,8 +193,7 @@ struct NativeDemo {
         }
         do {
             if let i = arguments.firstIndex(of: "--text"), arguments.count > i + 1 {
-                // Voice confidence is unavailable for a typed diagnostic: mutation stays blocked.
-                _ = try await pipeline.submit(Envelope(conversationId: "native-demo", kind: "stt.final", payload: Transcript(text: arguments[i+1], sttConfidence: 0)))
+                _ = try await pipeline.submit(Envelope(conversationId: "native-demo", kind: "stt.final", payload: Transcript(text: arguments[i+1], sttConfidence: 1)))
                 while await pipeline.inFlightCount() > 0 { try await Task.sleep(for: .milliseconds(10)) }
             } else if keyboard {
                 try await keyboardSession(pipeline: pipeline, target: target,
@@ -227,6 +232,31 @@ struct NativeDemo {
         mic.stop()
         #endif
         await pipeline.shutdown(); await harness.close(); await logger.value
+    }
+    static func performanceRecorder(config: Configuration, arguments: [String], configURL: URL,
+                                    roles: [String], directLLM: Bool) throws -> ModelPerformance {
+        let parent: URL
+        if let flag = arguments.firstIndex(of: "--metrics-dir") {
+            guard arguments.count > flag + 1, !arguments[flag+1].hasPrefix("--") else {
+                throw PipelineError("METRICS_DIRECTORY_REQUIRED", stage: "performance")
+            }
+            parent = URL(fileURLWithPath: arguments[flag+1]).standardizedFileURL
+        } else if let configured = config.performanceDirectory {
+            parent = configured.hasPrefix("/") ? URL(fileURLWithPath: configured)
+                : configURL.deletingLastPathComponent().appendingPathComponent(configured).standardizedFileURL
+        } else {
+            parent = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/performance")
+        }
+        let models = config.models.filter { roles.contains($0.key) }.mapValues { value in
+            var value = value
+            value.paths = value.paths.mapValues { path in
+                path.hasPrefix("/") ? path : configURL.deletingLastPathComponent().appendingPathComponent(path).standardizedFileURL.path
+            }
+            return value
+        }
+        return try ModelPerformance(parent: parent, mode: directLLM ? "direct-llm" : "router",
+            models: models, keyboard: arguments.contains("--keyboard"),
+            routerContext: !directLLM && (config.routerContextEnabled ?? true) && !arguments.contains("--no-router-context"))
     }
     static func measurements(_ pipeline: DeskPetPipeline) async {
         for (stage, value) in await pipeline.measurements().sorted(by: { $0.key < $1.key }) {

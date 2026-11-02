@@ -21,7 +21,9 @@ Xcode에서 `Package.swift`를 열어 사용할 수 있습니다. macOS에서 �
 ./run.command
 ```
 
-마이크 대신 키보드로 입력하려면 `./run.command --keyboard`를 실행하거나 `run-keyboard.command`를 더블클릭합니다. 문장을 입력한 뒤 Enter로 전송하고 `/quit` 또는 `Ctrl-C`로 종료합니다. STT·VAD 모델은 로드하지 않으며, 기존 리마인드·라우터·Harness·음성 출력은 사용합니다. 키보드 입력은 일반 대화와 조회를 위한 읽기 전용 모드이며 승인·업무 변경은 실행하지 않습니다.
+마이크 대신 키보드로 입력하려면 `./run.command --keyboard`를 실행하거나 `run-keyboard.command`를 더블클릭합니다. 문장을 입력한 뒤 Enter로 전송하고 `/quit` 또는 `Ctrl-C`로 종료합니다. STT·VAD 모델은 로드하지 않으며, 기존 리마인드·라우터·Harness·음성 출력은 사용합니다. 키보드에서도 승인·업무 변경을 전달하며 확정 입력 신뢰도는 1입니다. 읽기만 실행하려면 `--read-only`를 명시합니다.
+
+`./run.command --keyboard --direct-llm`은 라우터를 로드하지 않고 기존 Harness의 Gemini로 바로 전달합니다. 모델별 시간과 프로세스 메모리는 실행마다 `.build/performance/` 아래 CSV로 기록합니다. 옵션과 측정 범위는 [모델 성능 기록](docs/model-performance.md)을 참고하세요.
 
 하드웨어 모의 화면과 Harness를 빌드·실행한 뒤 Mac 마이크·스피커를 사용하는 실제 파이프라인을 시작합니다. `Ctrl-C`로 함께 종료합니다. 처음 실행할 때 `Models/native.local.json`을 예제에서 만들며 기존 설정은 유지합니다. 실행 절차와 옵션은 [네이티브 모델 연결](docs/native-models.md)을 참고하세요.
 

@@ -83,7 +83,9 @@ Swift 실행 파일, 네이티브 backend와 하드웨어 모의 화면을 증�
 
 | 옵션 | 동작 |
 | --- | --- |
-| `--keyboard` | 마이크·STT 대신 터미널 문장을 입력하는 읽기 전용 모드. Enter로 전송, `/quit` 또는 Ctrl-C로 종료 |
+| `--keyboard` | 마이크·STT 대신 터미널 문장 입력. 확정 입력 신뢰도 1, 승인·업무 변경 전달 가능. Enter로 전송, `/quit` 또는 Ctrl-C로 종료 |
+| `--direct-llm` | 라우터 로드·추론 없이 기존 Harness의 Gemini로 최종 발화 전달 |
+| `--metrics-dir DIR` | 실행별 성능 CSV를 저장할 상위 폴더 지정. 기본 `.build/performance` |
 | `--check` | 모델·설정 파일을 점검하고 종료. GPU·마이크·외부 API·서비스 실행 없음 |
 | `--no-build` | Swift 진입점 외의 증분 빌드를 생략하고 준비된 구성 요소 실행 |
 | `--config FILE` | 다른 native 설정 파일 사용 |
@@ -97,7 +99,9 @@ Swift 실행 파일, 네이티브 backend와 하드웨어 모의 화면을 증�
 
 키보드 입력은 `./run.command --keyboard` 또는 `run-keyboard.command` 더블클릭으로 시작한다. 기본 리마인드와 기존 대화 맥락·라우터·Harness·TTS/스피커 경로를 사용하며 마이크를 시작하거나 STT·VAD 모델을 로드하지 않는다. 한 문장씩 입력한 뒤 Enter로 전송한다. `/quit`, `/exit`, EOF 또는 Ctrl-C로 종료하고 이 진입점이 시작한 프로세스를 정리한다.
 
-키보드 모드는 일반 대화·PR 조회용 진단 입력이다. 기존 `--text`와 마찬가지로 실제 음성 점수가 없으므로 STT 점수 `0`을 전달한다. 데모의 일반 라우팅에만 이 진단 입력을 허용하고 모델의 실제 라우터 점수는 유지한다. Harness의 STT·승인 조건과 공통 파이프라인의 승인 코드는 변경하지 않는다. 진입점이 시작하는 서버는 쓰기 capability를 열지 않으며, Eureka Adapter도 변경 요청을 거절한다. 키보드로 승인·업무 변경을 실행하지 않는다. 하네스 코드와 입력 계약은 수정하지 않는다.
+키보드와 `--text`는 사용자 지시에 따라 확정 입력 신뢰도 1을 전달한다. 키보드의 전달용 종합 신뢰도도 1로 두며 원본 라우터 head·modelConfidence는 그대로 보존한다. 키보드 전용 읽기 차단과 파이프라인의 별도 승인 신뢰도 조건을 제거했다. 기본 진입점은 키보드에서도 서버의 쓰기 capability를 열며, `--read-only`를 명시한 경우에만 끈다. 확인 질문·사용자 답변·pending ID 등 기존 Harness 업무 흐름은 유지하고 Harness 구현은 수정하지 않는다.
+
+라우터를 생략하려면 `--direct-llm`을 추가한다. 라우터 모델을 로드하지 않고 모든 최종 입력을 기존 Harness의 Gemini로 전달하며 전달용 신뢰도는 1이다. 모델별 소요 시간과 프로세스 메모리는 `.build/performance/`에 기록한다. [모델 성능 기록](model-performance.md)에 파일 형식과 측정 범위를 설명한다.
 
 기본 저장소 위치는 pipeline의 형제 폴더 `LLM_test`, `deskpet-hardware`다. 위치가 다르면 `DESKPET_HARNESS_DIR`, `DESKPET_HARDWARE_DIR` 환경 변수로 지정한다. 필요한 개발 도구는 Swift·CMake·Node.js·pnpm·Homebrew이며, 모델 최초 준비는 위 절차를 따른다. 화면 실행에 필요한 SDL2·SDL2_ttf는 진입점이 준비한다.
 

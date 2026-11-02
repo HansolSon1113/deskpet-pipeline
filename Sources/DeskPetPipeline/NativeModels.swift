@@ -32,14 +32,18 @@ public final class NativeBackendLibrary: @unchecked Sendable {
 public final class NativeInferenceModel: @unchecked Sendable {
     private let library: NativeBackendLibrary
     private let handle: UnsafeMutableRawPointer
+    private let performance: ModelPerformance?
     public let configuration: NativeModelConfiguration
-    public init(library: NativeBackendLibrary, configuration: NativeModelConfiguration) throws {
+    public init(library: NativeBackendLibrary, configuration: NativeModelConfiguration, performance: ModelPerformance? = nil) throws {
         if ["router", "output"].contains(configuration.role) {
             guard ["metal", "cuda"].contains(configuration.device) else {
                 throw PipelineError("GPU_REQUIRED", stage: "native.load")
             }
         }
-        self.library = library; self.configuration = configuration
+        self.library = library; self.configuration = configuration; self.performance = performance
+        let span = performance?.begin(role: configuration.role, backend: configuration.backend, device: configuration.device, phase: "load")
+        var loaded = false
+        defer { performance?.end(span, status: loaded ? "ok" : "failed") }
         let json = String(decoding: try JSONEncoder().encode(configuration), as: UTF8.self)
         var error: UnsafeMutablePointer<CChar>?
         guard let handle = dp_model_create(library.handle, json, &error) else {
@@ -47,6 +51,7 @@ public final class NativeInferenceModel: @unchecked Sendable {
             throw PipelineError("MODEL_LOAD_FAILED", stage: configuration.role, message: error.map { String(cString: $0) } ?? "")
         }
         self.handle = handle
+        loaded = true
     }
     deinit { dp_model_destroy(library.handle, handle) }
     fileprivate func submit<Input: Encodable>(_ input: Input) throws -> NativeInferenceJob {
@@ -59,13 +64,17 @@ public final class NativeInferenceModel: @unchecked Sendable {
         }
         return NativeInferenceJob(model: self, library: library, handle: job)
     }
-    public func run<Input: Encodable & Sendable, Output: Decodable & Sendable>(_ input: Input, as: Output.Type) async throws -> Output {
+    public func run<Input: Encodable & Sendable, Output: Decodable & Sendable>(_ input: Input, as: Output.Type, measurement: String = "inference") async throws -> Output {
         guard !["router", "output"].contains(configuration.role) else { throw PipelineError("GPU_EXECUTOR_REQUIRED", stage: configuration.role) }
+        let span = performance?.begin(role: configuration.role, backend: configuration.backend, device: configuration.device, phase: measurement)
+        var completed = false
+        defer { if !completed { performance?.end(span, status: Task.isCancelled ? "cancelled" : "failed") } }
         let job = try submit(input)
         return try await withTaskCancellationHandler {
             // Keep the job/model/library alive until physical completion, even on cancellation.
             while true {
                 if let result = job.poll() {
+                    performance?.end(span, status: Self.status(result)); completed = true
                     return try await decode(result, as: Output.self)
                 }
                 if Task.isCancelled {
@@ -85,6 +94,7 @@ public final class NativeInferenceModel: @unchecked Sendable {
         guard ["router", "output"].contains(configuration.role), ["metal", "cuda"].contains(configuration.device) else {
             throw PipelineError("GPU_REQUIRED", stage: configuration.role)
         }
+        let span = performance?.begin(role: configuration.role, backend: configuration.backend, device: configuration.device, phase: "inference")
         let operation = GPUOperation<Data> { [self] in
             let job = try submit(input)
             return GPUCompletion(cancel: { job.cancel() }, poll: { job.poll() })
@@ -92,7 +102,12 @@ public final class NativeInferenceModel: @unchecked Sendable {
         let result: Result<Data, any Error>
         do { result = .success(try await executor.run(operation)) }
         catch { result = .failure(error) }
+        performance?.end(span, status: Self.status(result))
         return try await decode(result, as: Output.self)
+    }
+    private static func status(_ result: Result<Data, any Error>) -> String {
+        if Task.isCancelled { return "cancelled" }
+        switch result { case .success: return "ok"; case .failure: return "failed" }
     }
     private func decode<Output: Decodable>(_ result: Result<Data, any Error>, as: Output.Type) async throws -> Output {
         switch result {
@@ -271,7 +286,8 @@ public actor NativeStreamingSTT: StreamingSpeechRecognizer {
     private func recognize(_ pcm: Data, start: Date, end: Date, final: Bool) async throws -> Transcript {
         struct Input: Encodable, Sendable { var pcm: String; var language = "ko" }
         struct Reply: Codable, Sendable { var text: String; var confidence: Double }
-        let result = try await model.run(Input(pcm: pcm.base64EncodedString()), as: Reply.self)
+        let result = try await model.run(Input(pcm: pcm.base64EncodedString()), as: Reply.self,
+                                         measurement: final ? "final" : "partial")
         if final && !result.text.isEmpty { await NativeConsole.value("stt", result) }
         return Transcript(text: result.text, isFinal: final, sttConfidence: result.confidence,
                           audioStartedAt: start, audioEndedAt: end)
@@ -309,7 +325,7 @@ public struct NativeVAD: ResettableVoiceActivityDetector {
     public func reset() async throws {
         struct Input: Encodable, Sendable { var reset = true }
         struct Reply: Decodable, Sendable { var activity: String }
-        _ = try await model.run(Input(), as: Reply.self)
+        _ = try await model.run(Input(), as: Reply.self, measurement: "reset")
     }
     public func classify(_ frame: AudioFrame) async throws -> VoiceActivity {
         struct Input: Encodable, Sendable { var pcm: String }

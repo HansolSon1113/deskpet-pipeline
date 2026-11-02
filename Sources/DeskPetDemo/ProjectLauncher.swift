@@ -43,17 +43,20 @@ enum ProjectLauncher {
     static func run(_ arguments: [String]) async throws {
         let options = Array(arguments.drop(while: { $0 != "--project" }).dropFirst())
         if options.contains("--help") {
-            print("./run.command [--keyboard] [--no-router-context] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
+            print("./run.command [--keyboard] [--direct-llm] [--metrics-dir DIR] [--no-router-context] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
             print("기존 모의 화면, Harness 서버, 파이프라인을 함께 실행합니다. --keyboard는 마이크 대신 터미널 입력을 사용합니다. Ctrl-C로 모두 종료합니다.")
             return
         }
         var customConfig: String?
+        var metricsDirectory: String?
         var i = 0
         while i < options.count {
-            if options[i] == "--config" {
-                guard i+1 < options.count, !options[i+1].hasPrefix("--") else { throw fault("CONFIG_REQUIRED", "--config 뒤에 파일 경로를 지정하세요.") }
-                customConfig = options[i+1]; i += 2
-            } else if ["--keyboard", "--no-router-context", "--no-build", "--check", "--headless", "--read-only"].contains(options[i]) { i += 1 }
+            if options[i] == "--config" || options[i] == "--metrics-dir" {
+                guard i+1 < options.count, !options[i+1].hasPrefix("--") else { throw fault("CONFIG_REQUIRED", "\(options[i]) 뒤에 경로를 지정하세요.") }
+                if options[i] == "--config" { customConfig = options[i+1] }
+                else { metricsDirectory = options[i+1] }
+                i += 2
+            } else if ["--keyboard", "--direct-llm", "--no-router-context", "--no-build", "--check", "--headless", "--read-only"].contains(options[i]) { i += 1 }
             else { throw fault("UNKNOWN_OPTION", options[i]) }
         }
         let files = FileManager.default
@@ -74,11 +77,13 @@ enum ProjectLauncher {
         for key in ["HARNESS_WS_TOKEN", "GITHUB_TEST_REPO", "GITHUB_TEST_PR"] {
             guard environment[key]?.isEmpty == false else { throw fault("CONFIGURATION_MISSING", "기존 Harness .env에 \(key)을 설정하세요.") }
         }
-        if !options.contains("--read-only"), !options.contains("--keyboard"), environment["DESKPET_STORE_PATH"]?.isEmpty != false {
+        if !options.contains("--read-only"), environment["DESKPET_STORE_PATH"]?.isEmpty != false {
             throw fault("STORE_REQUIRED", "쓰기 실행에는 기존 .env의 DESKPET_STORE_PATH가 필요합니다.")
         }
         let keyboard = options.contains("--keyboard")
-        let roles = keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"]
+        let directLLM = (config.directLLM ?? false) || options.contains("--direct-llm")
+        let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
+            .filter { !directLLM || $0 != "router" }
         for role in roles {
             guard let model = config.models[role], model.role == role else { throw fault("MODEL_CONFIGURATION_MISSING", role) }
             for path in model.paths.values where !files.fileExists(atPath: resolve(path)) {
@@ -172,7 +177,7 @@ enum ProjectLauncher {
                 }
             }
             var serverArgs = ["node", "--import", "tsx", "scripts/server.ts"]
-            if !options.contains("--read-only"), !keyboard { serverArgs += ["--allow-github-writes", "--allow-eureka-writes"] }
+            if !options.contains("--read-only") { serverArgs += ["--allow-github-writes", "--allow-eureka-writes"] }
             if await welcomed(serverURL, token: environment["HARNESS_WS_TOKEN"]!) {
                 throw fault("HARNESS_ALREADY_RUNNING", "이미 Harness가 실행 중입니다. 기존 서버를 종료한 뒤 다시 실행하세요: \(serverURL.absoluteString)")
             }
@@ -186,6 +191,8 @@ enum ProjectLauncher {
             let keyboardPipe = keyboard ? Pipe() : nil
             var pipelineArgs = [URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path, "--native", configURL.path, keyboard ? "--keyboard" : "--live"]
             if options.contains("--no-router-context") { pipelineArgs.append("--no-router-context") }
+            if directLLM { pipelineArgs.append("--direct-llm") }
+            if let metricsDirectory { pipelineArgs += ["--metrics-dir", URL(fileURLWithPath: metricsDirectory).standardizedFileURL.path] }
             let pipeline = try start("pipeline", pipelineArgs, directory: root, console: true, input: keyboardPipe?.fileHandleForReading ?? FileHandle.nullDevice)
             try? keyboardPipe?.fileHandleForReading.close()
             let keyboardRelay: DispatchSourceRead? = keyboardPipe.map { pipe in

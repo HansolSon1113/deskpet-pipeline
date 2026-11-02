@@ -28,6 +28,13 @@ void *dp_model_submit(dp_library *, void *, const char *, char **error);
 int dp_model_poll(dp_library *, void *, const char **result, const char **error);
 void dp_model_cancel(dp_library *, void *);
 void dp_model_release_job(dp_library *, void *);
+/* Process-wide measurements in bytes, not per-model GPU allocations. Zero
+   availability flags mean unavailable, never a measured zero. */
+typedef struct dp_process_memory {
+    uint64_t resident_bytes, peak_resident_bytes, footprint_bytes;
+    int resident_available, peak_available, footprint_available;
+} dp_process_memory;
+dp_process_memory dp_read_process_memory(void);
 #ifdef __cplusplus
 }
 #endif
