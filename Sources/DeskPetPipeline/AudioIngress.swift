@@ -14,6 +14,8 @@ public protocol MicrophoneSource: Sendable {
     // report lost frames; the pipeline does not retain an unbounded microphone stream.
     func nextFrame() async throws -> AudioFrame?
 }
+/// Source owns a capture watchdog and can intentionally pause delivery during playback.
+public protocol ManagedMicrophoneSource: MicrophoneSource {}
 public protocol VoiceActivityDetector: Sendable { func classify(_ frame: AudioFrame) async throws -> VoiceActivity }
 public protocol ResettableVoiceActivityDetector: VoiceActivityDetector { func reset() async throws }
 public protocol AudioInputEpochValidator: Sendable { func isCurrent(_ inputEpoch: UInt64) -> Bool }
@@ -67,7 +69,14 @@ public struct AudioIngress: Sendable {
                       frame.chunk.sampleRate == config.sampleRate, frame.chunk.channels == config.channels else {
                     throw PipelineError("AUDIO_DEVICE_ERROR", stage: "audio.format")
                 }
+                if frame.inputEpoch != epoch {
+                    if let session { await pipeline.cancelSpeech(sessionId: session) }
+                    session = nil; bytes = 0; damaged = false; epoch = frame.inputEpoch
+                    if let resettable = vad as? any ResettableVoiceActivityDetector { await resettable.reset() }
+                }
+                guard await pipeline.acceptsInput(epoch: frame.inputEpoch) else { continue }
                 let activity = try await withTimeout(config.frameTimeout, stage: "vad") { [vad] in try await vad.classify(frame) }
+                guard await pipeline.acceptsInput(epoch: frame.inputEpoch) else { continue }
                 switch activity {
                 case .silence:
                     if session == nil, !damaged, config.preRollBytes > 0, !frame.chunk.data.isEmpty {
