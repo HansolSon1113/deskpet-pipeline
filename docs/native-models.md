@@ -85,6 +85,7 @@ Swift 실행 파일, 네이티브 backend와 하드웨어 모의 화면을 증�
 | --- | --- |
 | `--keyboard` | 마이크·STT 대신 터미널 문장 입력. 확정 입력 신뢰도 1, 승인·업무 변경 전달 가능. Enter로 전송, `/quit` 또는 Ctrl-C로 종료 |
 | `--direct-llm` | 라우터 로드·추론 없이 기존 Harness의 Gemini로 최종 발화 전달 |
+| `--short-output` | `talk`(`chat`) 경로의 출력 모델 응답을 핵심 항목(예: 재료·준비물)과 5~6문장 과정 요약으로 간결하게 제한 |
 | `--metrics-dir DIR` | 실행별 성능 CSV를 저장할 상위 폴더 지정. 기본 `.build/performance` |
 | `--check` | 모델·설정 파일을 점검하고 종료. GPU·마이크·외부 API·서비스 실행 없음 |
 | `--no-build` | Swift 진입점 외의 증분 빌드를 생략하고 준비된 구성 요소 실행 |

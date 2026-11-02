@@ -30,8 +30,18 @@ private func waitForIdle(_ pipeline: DeskPetPipeline) async throws {
     let model = try NativeInferenceModel(library: library, configuration: NativeModelConfiguration(role: "output", device: "metal", paths: [:]))
     let executor = try GPUExecutor(capacity: 1)
     let output = NativeOutputModel(model: model, executor: executor)
+    #expect(!output.shortOutput)
+    let userMessages = [ChatMessage(role: "user", content: "파스타 레시피 알려줘")]
+    #expect(NativeOutputModel.preparedMessages(for: userMessages, shortOutput: false) == userMessages)
+    let shortMessages = NativeOutputModel.preparedMessages(for: userMessages, shortOutput: true)
+    #expect(shortMessages.count == 2)
+    #expect(shortMessages.first?.role == "system")
+    #expect(shortMessages.first?.content == NativeOutputModel.shortOutputPrompt)
+    #expect(shortMessages.last == userMessages.first)
+    let shortOutputModel = NativeOutputModel(model: model, executor: executor, shortOutput: true)
     let question = OutputRequest(requestId: UUID(), requiredText: "PR 1번을 승인할까요?", isQuestion: true, messages: [.init(role: "user", content: "바꿔 말해줘")])
     #expect(try await output.generate(question) == question.requiredText)
+    #expect(try await shortOutputModel.generate(question) == question.requiredText)
     #expect(executor.snapshot().submitted == 0)
     let request = OutputRequest(requestId: UUID(), requiredText: "", messages: [.init(role: "user", content: "안녕")])
     let task = Task { try await output.generate(request) }

@@ -145,14 +145,28 @@ private final class NativeInferenceJob: @unchecked Sendable {
 }
 
 public struct NativeOutputModel: OutputModel {
+    public static let shortOutputPrompt = """
+    당신은 데스크펫 음성 비서입니다. 긴 글을 그대로 작성하거나 장황하게 나열하지 말고, 마크다운 기호 없이 자연스러운 한국어 평문으로 간결하게 답하세요. 설명, 방법, 레시피 등 글 작성이 필요한 요청에는 핵심 항목(예: 필요한 재료나 준비물)만 간단히 언급하고 과정이나 핵심 내용을 5~6문장 정도로 짧게 요약해서 끝맺으세요.
+    """
     public let model: NativeInferenceModel
     public let executor: GPUExecutor
-    public init(model: NativeInferenceModel, executor: GPUExecutor) { self.model = model; self.executor = executor }
+    public let shortOutput: Bool
+    public init(model: NativeInferenceModel, executor: GPUExecutor, shortOutput: Bool = false) {
+        self.model = model
+        self.executor = executor
+        self.shortOutput = shortOutput
+    }
+    public static func preparedMessages(for messages: [ChatMessage], shortOutput: Bool) -> [ChatMessage] {
+        guard shortOutput, !messages.isEmpty else { return messages }
+        if messages.first?.role == "system" { return messages }
+        return [ChatMessage(role: "system", content: shortOutputPrompt)] + messages
+    }
     public func generate(_ request: OutputRequest) async throws -> String {
         guard request.action == nil, request.reminder == nil, !request.isQuestion, !request.messages.isEmpty else { return request.requiredText }
         struct Reply: Decodable, Sendable { var text: String }
         struct Input: Encodable, Sendable { var messages: [ChatMessage] }
-        let result = try await model.gpu(Input(messages: request.messages), executor: executor, as: Reply.self)
+        let messages = Self.preparedMessages(for: request.messages, shortOutput: shortOutput)
+        let result = try await model.gpu(Input(messages: messages), executor: executor, as: Reply.self)
         return result.text
     }
 }

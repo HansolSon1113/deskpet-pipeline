@@ -19,6 +19,7 @@ struct NativeDemo {
         var sttConfidenceThreshold: Double?
         var routerContextEnabled: Bool?
         var directLLM: Bool?
+        var shortOutput: Bool?
         var performanceDirectory: String?
         var startupReminder: Bool?
         var startupReminderText: String?
@@ -47,6 +48,7 @@ struct NativeDemo {
         let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: configURL))
         let routerContextEnabled = (config.routerContextEnabled ?? true) && !arguments.contains("--no-router-context")
         let directLLM = (config.directLLM ?? false) || arguments.contains("--direct-llm")
+        let shortOutput = (config.shortOutput ?? false) || arguments.contains("--short-output")
         let keyboard = arguments.contains("--keyboard")
         let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
             .filter { !directLLM || $0 != "router" }
@@ -59,6 +61,7 @@ struct NativeDemo {
         func model(_ role: String) throws -> NativeInferenceModel {
             guard var c = config.models[role], c.role == role else { throw PipelineError("MODEL_CONFIGURATION_MISSING", stage: role) }
             c.paths = c.paths.mapValues(resolve)
+            if role == "output", shortOutput { c.maxTokens = max(c.maxTokens, 256) }
             let path = resolve(c.library ?? config.library)
             if libraries[path] == nil { libraries[path] = try NativeBackendLibrary(path: path) }
             c.library = nil
@@ -119,7 +122,7 @@ struct NativeDemo {
         }
         if let say = arguments.firstIndex(of: "--say"), arguments.count > say + 1 {
             let output = try model("output")
-            _ = try await NativeOutputModel(model: output, executor: gpu).generate(OutputRequest(requestId: UUID(), requiredText: "", messages: [ChatMessage(role: "user", content: arguments[say+1])]))
+            _ = try await NativeOutputModel(model: output, executor: gpu, shortOutput: shortOutput).generate(OutputRequest(requestId: UUID(), requiredText: "", messages: [ChatMessage(role: "user", content: arguments[say+1])]))
             await gpu.shutdown(); return
         }
         var loaded: [String: NativeInferenceModel] = [:]
@@ -142,7 +145,7 @@ struct NativeDemo {
         var adapters = Adapters(stt: recognizer,
             router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
-            output: NativeOutputModel(model: loaded["output"]!, executor: gpu),
+            output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
             tts: NativeSpeechSynthesizer(model: loaded["tts"]!), speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {

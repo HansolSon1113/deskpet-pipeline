@@ -43,7 +43,7 @@ enum ProjectLauncher {
     static func run(_ arguments: [String]) async throws {
         let options = Array(arguments.drop(while: { $0 != "--project" }).dropFirst())
         if options.contains("--help") {
-            print("./run.command [--keyboard] [--direct-llm] [--metrics-dir DIR] [--no-router-context] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
+            print("./run.command [--keyboard] [--direct-llm] [--metrics-dir DIR] [--no-router-context] [--short-output] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
             print("기존 모의 화면, Harness 서버, 파이프라인을 함께 실행합니다. --keyboard는 마이크 대신 터미널 입력을 사용합니다. Ctrl-C로 모두 종료합니다.")
             return
         }
@@ -56,7 +56,7 @@ enum ProjectLauncher {
                 if options[i] == "--config" { customConfig = options[i+1] }
                 else { metricsDirectory = options[i+1] }
                 i += 2
-            } else if ["--keyboard", "--direct-llm", "--no-router-context", "--no-build", "--check", "--headless", "--read-only"].contains(options[i]) { i += 1 }
+            } else if ["--keyboard", "--direct-llm", "--no-router-context", "--short-output", "--no-build", "--check", "--headless", "--read-only"].contains(options[i]) { i += 1 }
             else { throw fault("UNKNOWN_OPTION", options[i]) }
         }
         let files = FileManager.default
@@ -191,6 +191,7 @@ enum ProjectLauncher {
             let keyboardPipe = keyboard ? Pipe() : nil
             var pipelineArgs = [URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path, "--native", configURL.path, keyboard ? "--keyboard" : "--live"]
             if options.contains("--no-router-context") { pipelineArgs.append("--no-router-context") }
+            if options.contains("--short-output") { pipelineArgs.append("--short-output") }
             if directLLM { pipelineArgs.append("--direct-llm") }
             if let metricsDirectory { pipelineArgs += ["--metrics-dir", URL(fileURLWithPath: metricsDirectory).standardizedFileURL.path] }
             let pipeline = try start("pipeline", pipelineArgs, directory: root, console: true, input: keyboardPipe?.fileHandleForReading ?? FileHandle.nullDevice)

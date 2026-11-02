@@ -46,7 +46,7 @@ enum JetsonLauncher {
     static func run(_ arguments: [String]) async throws {
         let options = Array(arguments.drop(while: { $0 != "--jetson" }).dropFirst())
         if options.contains("--help") {
-            print("./run-linux.sh [--keyboard] [--direct-llm] [--metrics-dir DIR] [--real-hardware] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
+            print("./run-linux.sh [--keyboard] [--direct-llm] [--no-router-context] [--short-output] [--metrics-dir DIR] [--real-hardware] [--config FILE] [--no-build] [--check] [--headless] [--read-only]")
             print("Linux / Jetson Orin Nano용 진입점입니다. --real-hardware 지정 시 ALSA/I2C 드라이버 및 config/jetson.json을 사용합니다.")
             return
         }
@@ -61,7 +61,7 @@ enum JetsonLauncher {
                 if options[i] == "--config" { customConfig = options[i + 1] }
                 else { metricsDirectory = options[i + 1] }
                 i += 2
-            } else if ["--keyboard", "--direct-llm", "--no-build", "--check", "--headless", "--read-only", "--real-hardware"].contains(options[i]) {
+            } else if ["--keyboard", "--direct-llm", "--no-router-context", "--short-output", "--no-build", "--check", "--headless", "--read-only", "--real-hardware"].contains(options[i]) {
                 i += 1
             } else {
                 throw fault("UNKNOWN_OPTION", options[i])
@@ -238,6 +238,8 @@ enum JetsonLauncher {
 
             let keyboardPipe = keyboard ? Pipe() : nil
             var pipelineArgs = [URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path, "--jetson-native", configURL.path, keyboard ? "--keyboard" : "--live"]
+            if options.contains("--no-router-context") { pipelineArgs.append("--no-router-context") }
+            if options.contains("--short-output") { pipelineArgs.append("--short-output") }
             if directLLM { pipelineArgs.append("--direct-llm") }
             if let metricsDirectory { pipelineArgs += ["--metrics-dir", URL(fileURLWithPath: metricsDirectory).standardizedFileURL.path] }
             let pipeline = try start("pipeline", pipelineArgs, directory: root, console: true, input: keyboardPipe?.fileHandleForReading ?? FileHandle.nullDevice)
@@ -286,7 +288,9 @@ enum JetsonLauncher {
             path.hasPrefix("/") ? path : root.appendingPathComponent(path).standardizedFileURL.path
         }
         let config = try JSONDecoder().decode(NativeDemo.Configuration.self, from: Data(contentsOf: configURL))
+        let routerContextEnabled = (config.routerContextEnabled ?? true) && !arguments.contains("--no-router-context")
         let directLLM = (config.directLLM ?? false) || arguments.contains("--direct-llm")
+        let shortOutput = (config.shortOutput ?? false) || arguments.contains("--short-output")
         let keyboard = arguments.contains("--keyboard")
         let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
             .filter { !directLLM || $0 != "router" }
@@ -299,6 +303,7 @@ enum JetsonLauncher {
         func model(_ role: String) throws -> NativeInferenceModel {
             guard var c = config.models[role], c.role == role else { throw PipelineError("MODEL_CONFIGURATION_MISSING", stage: role) }
             c.paths = c.paths.mapValues(resolve)
+            if role == "output", shortOutput { c.maxTokens = max(c.maxTokens, 256) }
             let path = resolve(c.library ?? config.library)
             if libraries[path] == nil { libraries[path] = try NativeBackendLibrary(path: path) }
             c.library = nil
@@ -310,7 +315,7 @@ enum JetsonLauncher {
         }
         if let say = arguments.firstIndex(of: "--say"), arguments.count > say + 1 {
             let output = try model("output")
-            let result = try await NativeOutputModel(model: output, executor: gpu).generate(OutputRequest(requestId: UUID(), requiredText: "", messages: [ChatMessage(role: "user", content: arguments[say + 1])]))
+            let result = try await NativeOutputModel(model: output, executor: gpu, shortOutput: shortOutput).generate(OutputRequest(requestId: UUID(), requiredText: "", messages: [ChatMessage(role: "user", content: arguments[say + 1])]))
             print(result); await gpu.shutdown(); return
         }
 
@@ -331,9 +336,9 @@ enum JetsonLauncher {
         let harness = try ServerHarness(url: url, token: token, performance: performance)
         let recognizer: any SpeechRecognizer = keyboard ? KeyboardOnlyRecognizer() : NativeStreamingSTT(model: loaded["stt"]!)
         var adapters = Adapters(stt: recognizer,
-            router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target) },
+            router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
-            output: NativeOutputModel(model: loaded["output"]!, executor: gpu),
+            output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
             tts: NativeSpeechSynthesizer(model: loaded["tts"]!), speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
