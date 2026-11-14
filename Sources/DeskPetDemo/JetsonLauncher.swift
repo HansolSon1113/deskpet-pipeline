@@ -379,11 +379,8 @@ enum JetsonLauncher {
         var timing = PipelineConfiguration()
         timing.routingMode = directLLM ? .directLLM : .model
         timing.confirmedTextInput = keyboard || arguments.contains("--text")
-        timing.routerTimeout = config.routerTimeout ?? 15; timing.outputTimeout = config.outputTimeout ?? 15
-        timing.sttTimeout = config.sttTimeout ?? 15; timing.ttsFirstChunkTimeout = config.ttsTimeout ?? 10
         timing.routeConfidenceThreshold = config.routeConfidenceThreshold ?? 0.3
         timing.sttConfidenceThreshold = config.sttConfidenceThreshold ?? 0.3
-        timing.requestTimeout = 120
         let pipeline = try DeskPetPipeline(adapters: adapters, configuration: timing)
         await pipeline.start(automaticReminders: false)
         let logger = Task {
@@ -427,7 +424,6 @@ enum JetsonLauncher {
                         conversationId: "native-demo")
                 }
                 var ingress = AudioIngressConfiguration(); ingress.sampleRate = 16_000; ingress.maxSegmentBytes = 960_000
-                ingress.microphoneTimeout = nil
                 ingress.preRollBytes = 6_400
                 let session = Task {
                     try await AudioIngress(microphone: mic, vad: NativeVAD(model: loaded["vad"]!), configuration: ingress).run(pipeline: pipeline, conversationId: "native-demo")

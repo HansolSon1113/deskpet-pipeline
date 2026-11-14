@@ -22,8 +22,6 @@ public struct AudioIngressConfiguration: Sendable {
     public var channels = 1
     public var maxFrameBytes = 64_000
     public var maxSegmentBytes = 2_000_000
-    public var frameTimeout: TimeInterval = 1
-    public var microphoneTimeout: TimeInterval? = 1
     public var preRollBytes = 0
     public init() {}
 }
@@ -40,7 +38,7 @@ public struct AudioIngress: Sendable {
     public func run(pipeline: DeskPetPipeline, conversationId: String) async throws {
         let config = configuration
         guard config.maxFrameBytes > 0, config.maxSegmentBytes > 0, config.sampleRate > 0,
-              config.channels > 0, config.frameTimeout.isFinite, config.frameTimeout > 0,
+              config.channels > 0,
               config.preRollBytes >= 0, config.preRollBytes <= config.maxSegmentBytes else {
             throw PipelineError("INVALID_CONFIGURATION", stage: "audio")
         }
@@ -49,10 +47,7 @@ public struct AudioIngress: Sendable {
         var preRoll: [AudioFrame] = []; var preRollSize = 0
         do {
             while !Task.isCancelled {
-                let next: AudioFrame?
-                if let limit = config.microphoneTimeout {
-                    next = try await withTimeout(limit, stage: "microphone") { [microphone] in try await microphone.nextFrame() }
-                } else { next = try await microphone.nextFrame() }
+                let next = try await microphone.nextFrame()
                 guard let frame = next else {
                     if let session { await pipeline.cancelSpeech(sessionId: session) }
                     return
@@ -67,7 +62,7 @@ public struct AudioIngress: Sendable {
                       frame.chunk.sampleRate == config.sampleRate, frame.chunk.channels == config.channels else {
                     throw PipelineError("AUDIO_DEVICE_ERROR", stage: "audio.format")
                 }
-                let activity = try await withTimeout(config.frameTimeout, stage: "vad") { [vad] in try await vad.classify(frame) }
+                let activity = try await vad.classify(frame)
                 switch activity {
                 case .silence:
                     if session == nil, !damaged, config.preRollBytes > 0, !frame.chunk.data.isEmpty {

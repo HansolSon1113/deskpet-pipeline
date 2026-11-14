@@ -50,7 +50,7 @@ public struct ServerEureka: EurekaAdapter {
         let requestId = UUID()
         var payload = ["requestId": requestId.uuidString]
         if let itemId { payload["itemId"] = itemId }
-        return try await connection.call(kind, requestId: requestId, deadline: Date().addingTimeInterval(8),
+        return try await connection.call(kind, requestId: requestId, deadline: Date.distantFuture,
                                          payload: payload, replyKind: replyKind)
     }
 }

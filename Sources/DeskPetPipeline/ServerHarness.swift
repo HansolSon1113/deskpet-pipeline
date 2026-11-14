@@ -86,7 +86,7 @@ public struct ServerHarness: HarnessAdapter, HarnessEventConsumer, HarnessNotice
         if let value = event.outputId { payload["outputId"] = value }
         if let value = event.deliveredText { payload["deliveredText"] = value }
         if let value = event.channel { payload["channel"] = value }
-        let data = try await call("pipeline.event", requestId: event.requestId, deadline: Date().addingTimeInterval(5), payload: payload, replyKind: "pipeline.event.result")
+        let data = try await call("pipeline.event", requestId: event.requestId, deadline: Date.distantFuture, payload: payload, replyKind: "pipeline.event.result")
         let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard result?["applied"] as? Bool == true else { throw PipelineError("HARNESS_EVENT_REJECTED", stage: "harness") }
         if ["question_wait_expired", "request_cancelled"].contains(event.kind) { await transport.retire(event.requestId) }

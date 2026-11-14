@@ -134,13 +134,12 @@ struct PipelineTests {
         #expect(result.status == .succeeded); #expect(await eureka.count() == 1)
         await pipeline.shutdown()
     }
-    @Test func writeTimeoutIsUnknown() async throws {
-        var config = PipelineConfiguration(); config.eurekaTimeout = 0.01
-        let eureka = MockEureka(items: [item()], behavior: .init(delay: 1))
-        let pipeline = try DeskPetPipeline(adapters: .mocks(router: fixtureRouter(), eureka: eureka), configuration: config)
+    @Test func slowExecutionCompletesWithoutArtificialTimeout() async throws {
+        let eureka = MockEureka(items: [item()], behavior: .init(delay: 0.05))
+        let pipeline = try DeskPetPipeline(adapters: .mocks(router: fixtureRouter(), eureka: eureka))
         await pipeline.start(automaticReminders: false)
         let id = try await send(pipeline, "보고서 완료"); try await idle(pipeline)
-        #expect(await pipeline.record(requestId: id)?.action?.status == .unknown)
+        #expect(await pipeline.record(requestId: id)?.action?.status == .succeeded)
         await pipeline.shutdown()
     }
     @Test func authFailureIsConfirmedFailure() async throws {
@@ -184,10 +183,9 @@ struct PipelineTests {
         #expect(await speaker.spoken().first?.contains("삭제") == false)
         await pipeline.shutdown()
     }
-    @Test func outputTimeoutFallsBack() async throws {
-        var config = PipelineConfiguration(); config.outputTimeout = 0.01
+    @Test func outputErrorFallsBack() async throws {
         let speaker = MockSpeaker()
-        let pipeline = try DeskPetPipeline(adapters: .mocks(output: MockOutput(behavior: .init(delay: 1)), speaker: speaker), configuration: config)
+        let pipeline = try DeskPetPipeline(adapters: .mocks(output: MockOutput(behavior: .init(error: PipelineError("OUTPUT_FAIL", stage: "output"))), speaker: speaker))
         await pipeline.start(automaticReminders: false)
         _ = try await send(pipeline, "안녕"); try await idle(pipeline)
         #expect(await speaker.spoken().count == 1)
@@ -233,12 +231,9 @@ struct PipelineTests {
         #expect(await speaker.spoken().isEmpty)
         await pipeline.shutdown()
     }
-    @Test func expiredOversizeAndDuplicateRequestsAreRejected() async throws {
+    @Test func oversizeAndDuplicateRequestsAreRejected() async throws {
         let pipeline = try DeskPetPipeline(adapters: .mocks(router: fixtureRouter(), eureka: MockEureka(items: [item()])))
         await pipeline.start(automaticReminders: false)
-        await #expect(throws: PipelineError.self) {
-            _ = try await pipeline.submit(Envelope(conversationId: "deskpet", deadlineAt: Date().addingTimeInterval(-1), kind: "stt.final", payload: Transcript(text: "보고서 완료")))
-        }
         await #expect(throws: PipelineError.self) { _ = try await send(pipeline, String(repeating: "x", count: 4_097)) }
         let envelope = Envelope(conversationId: "deskpet", kind: "stt.final", payload: Transcript(text: "보고서 완료"))
         _ = try await pipeline.submit(envelope); try await idle(pipeline)
@@ -355,9 +350,8 @@ extension PipelineTests {
         let decoded = try ContractCodec.decoder().decode(Envelope<Transcript>.self, from: bytes)
         #expect(decoded.requestId == value.requestId); #expect(decoded.createdAt == date)
     }
-    @Test func slowFirstAudioChunkFallsBackAndWebIsIndependent() async throws {
-        var config = PipelineConfiguration(); config.ttsFirstChunkTimeout = 0.01
-        let pipeline = try DeskPetPipeline(adapters: .mocks(tts: MockTTS(behavior: .init(delay: 1))), configuration: config)
+    @Test func ttsErrorFallsBackAndWebIsIndependent() async throws {
+        let pipeline = try DeskPetPipeline(adapters: .mocks(tts: MockTTS(behavior: .init(error: PipelineError("TTS_ERROR", stage: "tts")))))
         await pipeline.start(automaticReminders: false)
         let id = try await send(pipeline, "안녕"); try await idle(pipeline)
         #expect(await pipeline.record(requestId: id)?.delivery?.display == .completed)

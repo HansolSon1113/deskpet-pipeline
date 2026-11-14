@@ -32,7 +32,7 @@ private struct Job: Sendable {
 
 private struct AudioJob: Sendable { var job: Job; var segment: AudioSegment? = nil; var frame: STTFrame? = nil }
 private enum DisplayCommand: Sendable { case output(Job), idle }
-private struct PlaybackJob: Sendable { var job: Job; var pcm: PCMChannel; var deadline: Date }
+private struct PlaybackJob: Sendable { var job: Job; var pcm: PCMChannel }
 private struct DeliveryState: Sendable {
     var job: Job
     var started = ContinuousClock.now
@@ -50,6 +50,7 @@ public actor DeskPetPipeline {
     private let config: PipelineConfiguration
     private let adapters: Adapters
     private let context: RouterContextStore
+    private let injector: ExternalInjectionModule
     private let metrics = Metrics()
     private let sttQueue: Mailbox<AudioJob>
     private let routerQueue: Mailbox<Job>
@@ -94,6 +95,7 @@ public actor DeskPetPipeline {
         }
         try configuration.validate(); config = configuration; self.adapters = adapters
         context = RouterContextStore(configuration)
+        injector = ExternalInjectionModule(configuration: configuration)
         sttQueue = Mailbox(capacity: max(configuration.audioQueueCapacity, configuration.streamingFrameQueueCapacity))
         routerQueue = Mailbox(capacity: configuration.queueCapacity)
         outputQueue = Mailbox(capacity: configuration.queueCapacity)
@@ -208,6 +210,7 @@ public actor DeskPetPipeline {
         apiInFlight.removeAll()
         active.removeAll(); latest.removeAll(); cancellation.removeAll(); noticeJobs.removeAll(); earlyNotices.removeAll(); lastTurns.removeAll(); recordConversations.removeAll()
         deliveries.removeAll(); pcmChannels.removeAll(); eventSink.finish()
+        await injector.reset()
     }
     private func emit(_ event: PipelineEvent) {
         if case .dropped = eventSink.yield(event) { droppedEvents += 1 }
@@ -232,13 +235,12 @@ public actor DeskPetPipeline {
         guard !original.payload.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError("NO_SPEECH", stage: "admission")
         }
-        guard original.deadlineAt.map({ $0 > Date() }) ?? true else { throw PipelineError("DEADLINE_EXCEEDED", stage: "admission") }
         var envelope = original
         let pending = await context.pendingRequest(envelope.conversationId)
         var preResolved: TargetResolution?
         if let pending, records[pending]?.action?.status == .needsClarification {
             let target = await context.activeTarget(envelope.conversationId)
-            let resolution = try await withTimeout(config.routerTimeout, stage: "clarification.target") { [adapters, original] in
+            let resolution = try await ExecutionDeadlinePolicy.unbounded.run { [adapters, original] in
                 guard let router = adapters.router else { return TargetResolution.omitted }
                 return try await router.resolveTarget(in: original.payload)
             }
@@ -259,7 +261,6 @@ public actor DeskPetPipeline {
         }
         try reserveRecord(envelope.requestId)
         guard active.count - (replacingAudio == nil ? 0 : 1) < config.maxInFlight else { throw PipelineError("QUEUE_FULL", stage: "admission") }
-        envelope.deadlineAt = min(envelope.deadlineAt ?? .distantFuture, Date().addingTimeInterval(config.requestTimeout))
         let reservation = try await routerQueue.reserve()
         let audioStillCurrent = replacingAudio.map { token in active[token].map { current($0) } ?? false } ?? true
         guard running, audioStillCurrent, active.count - (replacingAudio == nil ? 0 : 1) < config.maxInFlight,
@@ -302,7 +303,7 @@ public actor DeskPetPipeline {
             await sttQueue.release(reservation); throw PipelineError("QUEUE_FULL", stage: "stt")
         }
         let envelope = Envelope(conversationId: conversationId,
-            deadlineAt: Date().addingTimeInterval(config.requestTimeout), kind: "audio.segment", payload: Transcript(text: ""))
+            kind: "audio.segment", payload: Transcript(text: ""))
         do { try reserveRecord(envelope.requestId) }
         catch { await sttQueue.release(reservation); throw error }
         let job = Job(envelope: envelope); let previous = latest[conversationId]
@@ -320,7 +321,7 @@ public actor DeskPetPipeline {
         guard running, active.count < config.maxInFlight else { throw PipelineError("QUEUE_FULL", stage: "stt.stream") }
         guard adapters.stt is any StreamingSpeechRecognizer else { throw PipelineError("STREAMING_STT_UNAVAILABLE", stage: "stt.stream") }
         guard conversationId.utf8.count <= 256 else { throw PipelineError("INPUT_TOO_LARGE", stage: "stt.stream") }
-        let envelope = Envelope(conversationId: conversationId, deadlineAt: Date().addingTimeInterval(config.requestTimeout),
+        let envelope = Envelope(conversationId: conversationId,
                                 kind: "audio.stream", payload: Transcript(text: ""))
         try reserveRecord(envelope.requestId)
         let job = Job(envelope: envelope); let previous = latest[conversationId]
@@ -341,7 +342,7 @@ public actor DeskPetPipeline {
         guard current(job) else { throw CancellationError() }
         let start = ContinuousClock.now
         defer { Task { [metrics] in await metrics.record("stt", since: start) } }
-        return try await perform(token: job.token, timeout: timeout(job, config.sttTimeout), stage: "stt") {
+        return try await perform(token: job.token) {
             if let frame = audio.frame, let streaming = model as? any StreamingSpeechRecognizer {
                 return try await streaming.accept(frame)
             }
@@ -371,31 +372,89 @@ public actor DeskPetPipeline {
             reject(job, error: error)
         }
     }
-    private func receiveHarnessNotice(_ data: Data) async {
-        guard running, let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let notice = frame["notice"] as? [String: Any], let rawId = notice["requestId"] as? String,
-              let requestId = UUID(uuidString: rawId),
-              let action = notice["pipelineAction"] as? [String: Any], let rawStatus = action["status"] as? String,
-              let status = ActionStatus(rawValue: rawStatus) else { return }
-        guard var job = noticeJobs.removeValue(forKey: requestId) else {
-            if active.values.contains(where: { $0.envelope.requestId == requestId }), earlyNotices.count < config.journalCapacity {
-                earlyNotices[requestId] = data
-            }
-            return
+    private func externalContextSnapshot(for job: Job, hasNoticeJob: Bool) async -> ExternalInjectionContext {
+        let conversation = job.envelope.conversationId
+        let turns = await context.turns(conversation)
+        let isCurrentTurn = lastTurns[conversation] == job.envelope.turnId
+            && latest[conversation].map { $0 == job.token } ?? true
+        return ExternalInjectionContext(
+            isRunning: running,
+            isCurrentTurn: isCurrentTurn,
+            hasNoticeJob: hasNoticeJob,
+            hasActiveRequest: active.values.contains { $0.envelope.requestId == job.envelope.requestId },
+            turns: turns,
+            userText: job.envelope.payload.text
+        )
+    }
+    private func externalNoticeContext(for requestId: UUID) async -> ExternalInjectionContext? {
+        if let registered = noticeJobs[requestId] {
+            return await externalContextSnapshot(for: registered, hasNoticeJob: true)
         }
-        let facts = action["facts"] as? [String: String] ?? [:]
-        let result = ActionResult(operationId: job.operationId, status: status,
-            action: job.decision?.headOutputs.intention.value ?? .harnessTask, target: job.decision?.resolvedTarget, facts: facts)
-        storeAction(job, result)
-        guard lastTurns[job.envelope.conversationId] == job.envelope.turnId,
-              latest[job.envelope.conversationId].map({ $0 == job.token }) ?? true else { return }
-        if active[job.token] != nil { await cancelToken(job.token) }
-        job.token = UUID(); job.admitted = ContinuousClock.now; job.output = nil; job.event = nil
-        job.envelope.deadlineAt = Date().addingTimeInterval(config.requestTimeout)
-        active[job.token] = job; latest[job.envelope.conversationId] = job.token
-        let response = HarnessResult(action: result, question: notice["pipelineQuestion"] as? String,
-                                     resultText: frame["resultText"] as? String)
-        await apiCompleted(job, result: .success(response), harness: true)
+        if let activeJob = active.values.first(where: { $0.envelope.requestId == requestId }) {
+            return await externalContextSnapshot(for: activeJob, hasNoticeJob: false)
+        }
+        return nil
+    }
+    private func receiveHarnessNotice(_ data: Data) async {
+        let decision = await injector.prepareNotice(data) { [weak self] requestId in
+            await self?.externalNoticeContext(for: requestId)
+        }
+        switch decision {
+        case .deferEarly(let requestId, let raw):
+            if active.values.contains(where: { $0.envelope.requestId == requestId }), earlyNotices.count < config.journalCapacity {
+                earlyNotices[requestId] = raw
+            }
+        case .reject(let reason, let requestId):
+            if reason == .payloadTooLarge, let requestId {
+                emit(.error(requestId, PipelineError("RESULT_TOO_LARGE", stage: "harness")))
+            }
+        case .admit(let validated):
+            guard var job = noticeJobs.removeValue(forKey: validated.requestId) else { return }
+            let result = ActionResult(
+                operationId: job.operationId,
+                status: validated.status,
+                action: job.decision?.headOutputs.intention.value ?? .harnessTask,
+                target: job.decision?.resolvedTarget,
+                facts: validated.facts
+            )
+            storeAction(job, result)
+            guard running,
+                  lastTurns[job.envelope.conversationId] == job.envelope.turnId,
+                  latest[job.envelope.conversationId].map({ $0 == job.token }) ?? true else { return }
+            if active[job.token] != nil { await cancelToken(job.token) }
+            job.token = UUID(); job.admitted = ContinuousClock.now; job.output = nil; job.event = nil
+            active[job.token] = job; latest[job.envelope.conversationId] = job.token
+            await applyExternalDirective(validated.directive, to: job, action: result)
+        }
+    }
+    private func applyExternalDirective(_ directive: ExternalInjectionDirective, to original: Job, action: ActionResult) async {
+        var job = original
+        guard current(job) else { finish(job); return }
+        switch directive {
+        case .enqueueTalk(let messages, let fallbackText):
+            await context.clearPending(job.envelope.conversationId)
+            job.output = OutputRequest(
+                requestId: job.envelope.requestId,
+                action: nil,
+                reminder: nil,
+                requiredText: fallbackText,
+                isQuestion: false,
+                messages: messages
+            )
+            await enqueue(job, into: outputQueue)
+        case .enqueueAction(let requiredText, let isQuestion):
+            if isQuestion {
+                await ask(job, question: requiredText, harnessResult: action)
+                return
+            }
+            await context.clearPending(job.envelope.conversationId)
+            job.output = OutputRequest(
+                requestId: job.envelope.requestId,
+                action: action,
+                requiredText: requiredText
+            )
+            await enqueue(job, into: outputQueue)
+        }
     }
     private func reserveRecord(_ request: UUID) throws {
         guard records[request] == nil else { return }
@@ -411,15 +470,10 @@ public actor DeskPetPipeline {
         records[request] = RequestRecord(requestId: request); recordOrder.append(request)
     }
     private func current(_ job: Job) -> Bool {
-        running && active[job.token] != nil && latest[job.envelope.conversationId] == job.token &&
-        (job.envelope.deadlineAt ?? .distantPast) > Date()
+        running && active[job.token] != nil && latest[job.envelope.conversationId] == job.token
     }
-    private func timeout(_ job: Job, _ stage: TimeInterval) -> TimeInterval {
-        min(stage, (job.envelope.deadlineAt ?? Date()).timeIntervalSinceNow)
-    }
-    private func perform<T: Sendable>(token: UUID, timeout: TimeInterval, stage: String,
-                                     operation: @escaping @Sendable () async throws -> T) async throws -> T {
-        let task = Task { try await withTimeout(timeout, stage: stage, operation: operation) }
+    private func perform<T: Sendable>(token: UUID, operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        let task = Task { try await ExecutionDeadlinePolicy.unbounded.run(operation) }
         let operationId = UUID()
         cancellation[token, default: [:]][operationId] = { task.cancel() }
         defer {
@@ -484,6 +538,11 @@ public actor DeskPetPipeline {
     }
     private func inferRoute(_ original: Job, model: (any RouterModel)?) async throws -> (RouterInput, RouteDecision) {
         guard current(original) else { throw CancellationError() }
+        let sttScore = original.envelope.payload.sttConfidence
+        if !sttScore.isFinite || !(0...1).contains(sttScore) || sttScore < config.sttConfidenceThreshold {
+            throw PipelineError("STT_CONFIDENCE_LOW", stage: "stt",
+                                message: "STT \(sttScore), 기준 \(config.sttConfidenceThreshold)")
+        }
         if config.routingMode == .directLLM {
             let input = await context.prepare(original.envelope, resolution: .omitted)
             // This is a configured destination, not a classifier prediction.
@@ -503,27 +562,21 @@ public actor DeskPetPipeline {
         let job = original
         let start = ContinuousClock.now
         defer { Task { [metrics] in await metrics.record("router", since: start) } }
-        return try await perform(token: job.token, timeout: timeout(job, config.routerTimeout + (adapters.remoteRouter == nil ? 0 : config.remoteTimeout)), stage: "router") { [context, adapters, config, job, model] in
+        return try await perform(token: job.token) { [context, adapters, config, job, model] in
                 let resolution: TargetResolution
                 if let cached = job.targetResolution { resolution = cached }
-                else {
-                    resolution = try await withTimeout(config.routerTimeout, stage: "router.target") {
-                        try await model.resolveTarget(in: job.envelope.payload)
-                    }
-                }
+                else { resolution = try await model.resolveTarget(in: job.envelope.payload) }
                 if case .unique(let target) = resolution {
                     guard target.kind.utf8.count <= 64, target.entityId.utf8.count <= 256,
                           target.name.utf8.count <= 1_024 else { throw PipelineError("INVALID_TARGET", stage: "router") }
                 }
                 let input = await context.prepare(job.envelope, resolution: resolution)
                 let heads: HeadOutputs
-                do { heads = try await withTimeout(config.routerTimeout, stage: "router.heads") { try await model.heads(for: input) } }
+                do { heads = try await model.heads(for: input) }
                 catch {
                     try Task.checkCancellation()
                     guard let remote = adapters.remoteRouter else { throw error }
-                    heads = try await withTimeout(min(config.remoteTimeout, job.envelope.deadlineAt!.timeIntervalSinceNow), stage: "remote.router") {
-                        try await remote.heads(for: input, deadlineAt: job.envelope.deadlineAt!)
-                    }
+                    heads = try await remote.heads(for: input, deadlineAt: job.envelope.deadlineAt ?? .distantFuture)
                 }
                 let strings = [heads.target.value, heads.name.value, heads.priority.value, heads.task.value, heads.note.value]
                 guard strings.allSatisfy({ ($0?.utf8.count ?? 0) <= config.maxTranscriptBytes }),
@@ -533,9 +586,7 @@ public actor DeskPetPipeline {
                 let masked = DecisionComposer.mask(heads)
                 let provisional = DecisionComposer.compose(heads, confidence: 1, input: input, resolution: resolution,
                                                            threshold: config.routeConfidenceThreshold, sttThreshold: config.sttConfidenceThreshold)
-                let score = try await withTimeout(config.routerTimeout, stage: "router.confidence") {
-                    try await model.confidence(for: masked, missingSlots: provisional.missingRequiredSlots)
-                }
+                let score = try await model.confidence(for: masked, missingSlots: provisional.missingRequiredSlots)
                 var decision = DecisionComposer.compose(heads, confidence: score, input: input, resolution: resolution,
                                                        threshold: config.routeConfidenceThreshold, sttThreshold: config.sttConfidenceThreshold)
                 if config.confirmedTextInput {
@@ -557,13 +608,7 @@ public actor DeskPetPipeline {
             switch result.1.route {
             case .eureka: await dispatchAPI(job, harness: false)
             case .harness:
-                // Unsafe STT or missing slots never reach an adapter capable of external writes.
-                let sttScore = job.envelope.payload.sttConfidence
-                if !sttScore.isFinite || !(0...1).contains(sttScore) || sttScore < config.sttConfidenceThreshold {
-                    emit(.error(job.envelope.requestId, PipelineError("STT_CONFIDENCE_LOW", stage: "router",
-                        message: "STT \(sttScore), 기준 \(config.sttConfidenceThreshold)")))
-                    await ask(job, question: "말씀하신 내용을 정확히 듣지 못했어요. 다시 말씀해 주세요.")
-                } else if !result.1.missingRequiredSlots.isEmpty {
+                if !result.1.missingRequiredSlots.isEmpty {
                     emit(.error(job.envelope.requestId, PipelineError("MISSING_REQUIRED_SLOTS", stage: "router",
                         message: result.1.missingRequiredSlots.joined(separator: ", "))))
                     await ask(job, question: "대상과 필요한 내용을 다시 말씀해 주세요.")
@@ -583,6 +628,12 @@ public actor DeskPetPipeline {
             if current(job) {
                 let cause = error as? PipelineError ?? PipelineError("ROUTER_ADAPTER_ERROR", stage: "router", message: String(describing: error))
                 emit(.error(job.envelope.requestId, cause))
+                if cause.code == "STT_CONFIDENCE_LOW" {
+                    let result = ActionResult(operationId: job.operationId, status: .needsClarification, action: .chat,
+                                              target: nil, error: cause)
+                    await ask(job, question: "말씀하신 내용을 정확히 듣지 못했어요. 다시 말씀해 주세요.", harnessResult: result)
+                    return
+                }
                 // Preserve the final user utterance even when inference fails.
                 let input = await context.prepare(job.envelope, resolution: .omitted)
                 job.input = input; job.stamp = await context.commit(job.envelope, input: input, decision: nil)
@@ -643,7 +694,7 @@ public actor DeskPetPipeline {
         guard current(original), let decision = original.decision, let input = original.input else { throw CancellationError() }
         let job = original
         let request = ActionRequest(operationId: job.operationId, requestId: job.envelope.requestId,
-                                    decision: decision, deadlineAt: job.envelope.deadlineAt!)
+                                    decision: decision, deadlineAt: job.envelope.deadlineAt ?? .distantFuture)
         records[job.envelope.requestId]?.operation = request
         records[job.envelope.requestId]?.action = nil
         if harness {
@@ -654,7 +705,7 @@ public actor DeskPetPipeline {
         let start = ContinuousClock.now
         let response: HarnessResult
         do {
-            response = try await perform(token: job.token, timeout: timeout(job, harness ? config.harnessTimeout : config.eurekaTimeout), stage: harness ? "harness" : "eureka") { [job, adapters] in
+            response = try await perform(token: job.token) { [job, adapters] in
                 if let api {
                     var call = HarnessRequest(action: request, transcript: job.envelope.payload, context: input)
                     call.conversationId = job.envelope.conversationId
@@ -689,7 +740,7 @@ public actor DeskPetPipeline {
         var job = original
         guard let decision = job.decision else { finish(job); return }
         let request = ActionRequest(operationId: job.operationId, requestId: job.envelope.requestId,
-                                    decision: decision, deadlineAt: job.envelope.deadlineAt!)
+                                    decision: decision, deadlineAt: job.envelope.deadlineAt ?? .distantFuture)
         let response: HarnessResult
         do { response = try result.get() }
         catch { reject(job, error: error); return }
@@ -729,9 +780,33 @@ public actor DeskPetPipeline {
             earlyNotices.removeValue(forKey: job.envelope.requestId)
         }
         guard current(job) else { finish(job); return }
+        if harness {
+            let snapshot = await externalContextSnapshot(for: job, hasNoticeJob: noticeJobs[job.envelope.requestId] != nil)
+            let fallback = factualText(response.action, resultText: response.resultText)
+            let prep = await injector.prepareHarnessCompletion(
+                requestId: job.envelope.requestId,
+                operationId: response.action.operationId,
+                status: response.action.status,
+                facts: response.action.facts,
+                question: response.question,
+                resultText: response.resultText,
+                context: snapshot,
+                factualFallback: fallback
+            )
+            switch prep {
+            case .admit(let directive):
+                await applyExternalDirective(directive, to: job, action: response.action)
+            case .reject:
+                finish(job)
+            }
+            return
+        }
         if response.action.status == .needsClarification { await ask(job, question: response.question ?? "어느 대상을 말씀하시나요?", harnessResult: response.action); return }
         await context.clearPending(job.envelope.conversationId)
-        let text = factualText(response.action, resultText: response.resultText)
+        let text = RoutingHintSanitizer.safeFallback(
+            factualText(response.action, resultText: response.resultText),
+            defaultText: "처리 결과를 확인했어요."
+        )
         job.output = OutputRequest(requestId: job.envelope.requestId, action: response.action, requiredText: text)
         await enqueue(job, into: outputQueue)
     }
@@ -777,18 +852,19 @@ public actor DeskPetPipeline {
         if !job.terminal, records[job.envelope.requestId]?.action != nil { throw CancellationError() }
         let start = ContinuousClock.now
         defer { Task { [metrics] in await metrics.record("output", since: start) } }
-        return try await perform(token: job.terminal ? job.token : request.outputId, timeout: timeout(job, config.outputTimeout), stage: "output") {
+        return try await perform(token: job.terminal ? job.token : request.outputId) {
             try await model.generate(request)
         }
     }
     private func generated(_ original: Job, result: Result<String, any Error>) async {
         guard let request = original.output else { if original.terminal { finish(original) }; return }
         var job = original
-        var text = request.requiredText
+        var text = RoutingHintSanitizer.safeFallback(request.requiredText, defaultText: "요청 내용을 확인했어요.")
         do {
             let candidate = try result.get()
             if !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                candidate.utf8.count <= config.maxOutputBytes,
+               !RoutingHintSanitizer.containsForbiddenRoutingHint(candidate),
                (request.action == nil && request.reminder == nil && !request.isQuestion && job.terminal || candidate == request.requiredText) {
                 text = candidate
             }
@@ -799,7 +875,7 @@ public actor DeskPetPipeline {
         var emotion = status == .succeeded ? "cheerful" : "neutral"
         if status == nil, !job.isReminder, let classifier = adapters.emotion {
             let finalText = job.envelope.payload.text
-            emotion = (try? await withTimeout(1, stage: "emotion") { try await classifier.emotion(for: finalText) }) ?? "neutral"
+            emotion = (try? await classifier.emotion(for: finalText)) ?? "neutral"
         }
         guard current(job) else { return }
         job.event = OutputEvent(requestId: request.requestId, outputId: request.outputId, text: text,
@@ -814,7 +890,7 @@ public actor DeskPetPipeline {
         if let reminder = job.reminder {
             guard active.count == 1, waitingQuestion == nil, Date() >= quietUntil else { finish(job); return }
             do {
-                let fresh = try await perform(token: job.token, timeout: timeout(job, config.eurekaTimeout), stage: "reminder.check") { [adapters] in
+                let fresh = try await perform(token: job.token) { [adapters] in
                     try await adapters.eureka.reminder(itemId: reminder.target.entityId)
                 }
                 guard let fresh, fresh.key == reminder.key, fresh.description == reminder.description, fresh.eligible,
@@ -836,7 +912,7 @@ public actor DeskPetPipeline {
     private func publish(_ job: Job, web: any WebConsumer) async throws {
         guard running, let event = job.event else { throw CancellationError() }
         if !job.terminal, records[job.envelope.requestId]?.action != nil { return }
-        try await perform(token: event.outputId, timeout: config.outputTimeout, stage: "web") { try await web.publish(event) }
+        try await perform(token: event.outputId) { try await web.publish(event) }
     }
     private func displayCommand(_ command: DisplayCommand, display: any DisplayAdapter) async -> Bool {
         switch command {
@@ -844,7 +920,7 @@ public actor DeskPetPipeline {
         case .idle:
             guard running, active.isEmpty else { return false }
             do {
-                try await perform(token: idleDisplayToken, timeout: config.outputTimeout, stage: "display.idle") { try await display.idle() }
+                try await perform(token: idleDisplayToken) { try await display.idle() }
                 return true
             } catch { emit(.error(nil, PipelineError("DISPLAY_ERROR", stage: "display.idle"))); return false }
         }
@@ -852,10 +928,9 @@ public actor DeskPetPipeline {
     private let idleDisplayToken = UUID()
     private func show(_ job: Job, display: any DisplayAdapter) async -> Bool {
         guard current(job), let event = job.event else { return false }
-        let fallback = event.displayMode == .text
         var success = false
         do {
-            try await perform(token: job.executionToken, timeout: timeout(job, config.outputTimeout), stage: fallback ? "display.fallback" : "display") {
+            try await perform(token: job.executionToken) {
                 try await display.show(event)
             }
             success = true
@@ -867,15 +942,12 @@ public actor DeskPetPipeline {
         if !job.terminal, records[job.envelope.requestId]?.action != nil { return }
         let channel = PCMChannel(capacity: config.pcmQueueCapacity)
         pcmChannels[job.executionToken] = channel
-        let deadline = min(job.envelope.deadlineAt!, Date().addingTimeInterval(config.playbackTimeout))
         do {
-            try await perform(token: job.executionToken, timeout: deadline.timeIntervalSinceNow, stage: "tts") { [model, config, playbackQueue] in
-                let first: (any AudioSource, PCMChunk) = try await withTimeout(config.ttsFirstChunkTimeout, stage: "tts.first_chunk") {
-                    let source = try await model.audio(for: event)
-                    let value = try await source.nextChunk()
-                    guard let value else { throw PipelineError("TTS_ERROR", stage: "tts.empty") }
-                    return (source, value)
-                }
+            try await perform(token: job.executionToken) { [model, config, playbackQueue] in
+                let source = try await model.audio(for: event)
+                let firstChunk = try await source.nextChunk()
+                guard let firstChunk else { throw PipelineError("TTS_ERROR", stage: "tts.empty") }
+                let first = (source, firstChunk)
                 func validate(_ chunk: PCMChunk) throws {
                     guard chunk.data.count <= config.maxChunkBytes, chunk.sampleRate > 0, chunk.channels > 0 else {
                         throw PipelineError("AUDIO_BUFFER_ERROR", stage: "tts")
@@ -883,7 +955,7 @@ public actor DeskPetPipeline {
                 }
                 try validate(first.1); try await channel.send(first.1)
                 // One producer waits for playback capacity without discarding speech.
-                try await playbackQueue.send(PlaybackJob(job: job, pcm: channel, deadline: deadline))
+                try await playbackQueue.send(PlaybackJob(job: job, pcm: channel))
                 while let chunk = try await first.0.nextChunk() {
                     try Task.checkCancellation(); try validate(chunk); try await channel.send(chunk)
                 }
@@ -904,7 +976,7 @@ public actor DeskPetPipeline {
         }
         let jobId = UUID(); var success = false
         do {
-            try await perform(token: job.executionToken, timeout: audio.deadline.timeIntervalSinceNow, stage: "speaker") {
+            try await perform(token: job.executionToken) {
                 try await speaker.begin(jobId: jobId, event: event)
                 while let chunk = try await audio.pcm.receive() {
                     try Task.checkCancellation(); try await speaker.write(chunk, jobId: jobId)
@@ -1046,7 +1118,7 @@ public actor DeskPetPipeline {
               target.kind.utf8.count <= 64 else { throw PipelineError("INPUT_TOO_LARGE", stage: "scenario.reminder") }
         let request = UUID(); try reserveRecord(request)
         var job = Job(envelope: Envelope(requestId: request, conversationId: conversationId,
-            deadlineAt: Date().addingTimeInterval(config.requestTimeout), kind: "scenario.reminder",
+            kind: "scenario.reminder",
             payload: Transcript(text: "", sttConfidence: 0)))
         job.scenarioReminderTarget = target
         job.output = OutputRequest(requestId: request, requiredText: text, isQuestion: true)
@@ -1059,7 +1131,7 @@ public actor DeskPetPipeline {
         guard running, active.isEmpty, waitingQuestion == nil, Date() >= quietUntil,
               cancellation[pollToken] == nil else { return }
         do {
-            let items = try await perform(token: pollToken, timeout: config.eurekaTimeout, stage: "reminder.poll") { [adapters] in try await adapters.eureka.reminders() }
+            let items = try await perform(token: pollToken) { [adapters] in try await adapters.eureka.reminders() }
             guard items.count <= config.maxReminderItems else { throw PipelineError("INPUT_TOO_LARGE", stage: "reminder.poll") }
             guard active.isEmpty, waitingQuestion == nil, running else { return }
             let now = Date()
@@ -1073,7 +1145,7 @@ public actor DeskPetPipeline {
             guard let item = candidates.first, reminderHistory.count < config.maxReminderItems || reminderHistory[item.key] != nil else { return }
             let request = UUID(); try reserveRecord(request)
             var job = Job(envelope: Envelope(requestId: request, conversationId: conversationId,
-                deadlineAt: now.addingTimeInterval(config.requestTimeout), kind: "reminder", payload: Transcript(text: "")))
+                kind: "reminder", payload: Transcript(text: "")))
             job.reminder = item
             job.output = OutputRequest(requestId: request, reminder: item,
                 requiredText: "\(item.description) 마감은 \(DateCodec.reminderDeadline(item))이에요.")
@@ -1087,7 +1159,7 @@ public actor DeskPetPipeline {
     public func reconcile(_ request: ActionRequest) async throws -> ActionResult {
         guard records[request.requestId]?.action?.status == .unknown,
               records[request.requestId]?.operation?.operationId == request.operationId else { throw PipelineError("NOT_UNKNOWN", stage: "reconcile") }
-        let result = try await withTimeout(config.eurekaTimeout, stage: "reconcile") { [adapters] in
+        let result = try await ExecutionDeadlinePolicy.unbounded.run { [adapters] in
             if request.decision.route == .harness { return try await adapters.harness.reconcile(request) }
             return try await adapters.eureka.reconcile(request)
         }

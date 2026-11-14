@@ -29,15 +29,6 @@ public struct PipelineConfiguration: Sendable {
     public var maxReminderItems = 100
     public var sttConfidenceThreshold = 0.7
     public var routeConfidenceThreshold = 0.8
-    public var sttTimeout: TimeInterval = 5
-    public var routerTimeout: TimeInterval = 2
-    public var eurekaTimeout: TimeInterval = 8
-    public var harnessTimeout: TimeInterval = 30
-    public var outputTimeout: TimeInterval = 5
-    public var ttsFirstChunkTimeout: TimeInterval = 3
-    public var playbackTimeout: TimeInterval = 30
-    public var requestTimeout: TimeInterval = 60
-    public var remoteTimeout: TimeInterval = 30
     public var contextExpiry: TimeInterval = 300
     public var reminderPollInterval: TimeInterval = 300
     public var reminderQuietInterval: TimeInterval = 5
@@ -49,9 +40,7 @@ public struct PipelineConfiguration: Sendable {
         let counts = [queueCapacity, audioQueueCapacity, streamingFrameQueueCapacity, pcmQueueCapacity, maxInFlight, maxConcurrentEurekaRequests, maxConcurrentHarnessRequests, journalCapacity, eventCapacity, contextBytes,
                       maxContextTurns, maxConversations, maxTranscriptBytes, maxAudioBytes,
                       maxChunkBytes, maxOutputBytes, maxReminderItems]
-        let times = [sttTimeout, routerTimeout, eurekaTimeout, harnessTimeout, outputTimeout,
-                     ttsFirstChunkTimeout, playbackTimeout, requestTimeout, remoteTimeout,
-                     contextExpiry, reminderPollInterval, questionWait, textDisplayDuration, progressDelay]
+        let times = [contextExpiry, reminderPollInterval, questionWait, textDisplayDuration, progressDelay]
         guard counts.allSatisfy({ $0 > 0 }), times.allSatisfy({ $0.isFinite && $0 > 0 }),
               reminderQuietInterval.isFinite, reminderQuietInterval >= 0,
               (0...1).contains(sttConfidenceThreshold), (0...1).contains(routeConfidenceThreshold) else {
@@ -144,18 +133,14 @@ actor Mailbox<Element: Sendable> {
     var count: Int { storage.count }
 }
 
-func withTimeout<T: Sendable>(_ seconds: TimeInterval, stage: String,
-                              operation: @escaping @Sendable () async throws -> T) async throws -> T {
-    try Task.checkCancellation()
-    guard seconds > 0 else { throw PipelineError("DEADLINE_EXCEEDED", stage: stage) }
-    return try await withThrowingTaskGroup(of: T.self) { group in
-        group.addTask { try await operation() }
-        group.addTask {
-            try await Task.sleep(for: .seconds(seconds))
-            throw PipelineError("DEADLINE_EXCEEDED", stage: stage)
-        }
-        defer { group.cancelAll() }
-        let value = try await group.next()!
+/// Null-Object execution deadline policy: pipeline stages run without wall-clock timeouts
+/// and rely strictly on cooperative `Task` cancellation and bounded queues.
+enum ExecutionDeadlinePolicy: Sendable {
+    case unbounded
+
+    func run<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        let value = try await operation()
         try Task.checkCancellation()
         return value
     }

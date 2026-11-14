@@ -44,7 +44,7 @@ actor ServerConnection {
         do {
             let hello = try JSONSerialization.data(withJSONObject: ["type": "hello", "token": token, "role": "pipeline", "client": "deskpet-pipeline"])
             try await socket.send(.string(String(decoding: hello, as: UTF8.self)))
-            let data = try await withTimeout(5, stage: "harness.hello") { try await Self.receive(socket) }
+            let data = try await Self.receive(socket)
             let welcome = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard welcome?["type"] as? String == "welcome", welcome?["protocol"] as? String == "deskpet.harness.v1",
                   welcome?["role"] as? String == "pipeline", welcome?["schemaVersion"] as? String == "1.0" else {
@@ -60,11 +60,9 @@ actor ServerConnection {
     func request(frame: Data, messageId: String, requestId: String, replyKind: String, deadline: Date) async throws -> Data {
         try await connect()
         guard let socket else { throw PipelineError("HARNESS_DISCONNECTED", stage: "harness") }
-        return try await withTimeout(min(30, deadline.timeIntervalSinceNow), stage: "harness") { [self] in
-            try await withTaskCancellationHandler {
-                try await self.send(frame, socket: socket, messageId: messageId, requestId: requestId, replyKind: replyKind)
-            } onCancel: { Task { await self.cancel(messageId) } }
-        }
+        return try await withTaskCancellationHandler {
+            try await self.send(frame, socket: socket, messageId: messageId, requestId: requestId, replyKind: replyKind)
+        } onCancel: { Task { await self.cancel(messageId) } }
     }
     private func send(_ frame: Data, socket: URLSessionWebSocketTask, messageId: String, requestId: String, replyKind: String) async throws -> Data {
         try Task.checkCancellation()

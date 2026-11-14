@@ -149,9 +149,8 @@ public enum DecisionComposer {
             ([.updatePriority, .setPriority].contains(intent) ? [heads.priority.confidence] : []) +
             (intent == .mcp ? [heads.task.confidence] : [])
         let reliable = ([confidence] + requiredScores).allSatisfy { $0.isFinite && $0 >= threshold && $0 <= 1 }
-        let sttReliable = input.transcript.sttConfidence.isFinite && input.transcript.sttConfidence >= sttThreshold && input.transcript.sttConfidence <= 1
         let route: Route
-        if !reliable || !sttReliable || !missing.isEmpty || intent == .unclear { route = .harness }
+        if !reliable || !missing.isEmpty || intent == .unclear { route = .harness }
         else if intent == .chat { route = .output }
         else if [.acknowledgeReminder, .snoozeReminder].contains(intent) { route = .reminder }
         else if [.mcp, .reviewPR, .approvePR, .summarizePR, .confirmApprove, .confirmReject, .harnessTask].contains(intent) { route = .harness }
