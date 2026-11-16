@@ -12,13 +12,26 @@ if [ "${1:-}" = "--install-apt" ]; then
     libcurl4-openssl-dev libxml2-dev
 fi
 
+desired_mode="cpu"
+if [ "${DESKPET_USE_AUDIO_GPU:-0}" = "1" ] || [ "${SHERPA_ONNX_USE_GPU:-0}" = "1" ]; then
+  desired_mode="gpu"
+fi
+
 os_arch="$(uname -s)-$(uname -m)"
 case "$os_arch" in
   Linux-aarch64|Linux-arm64)
-    sherpa_candidates="sherpa-onnx-v2.0.1-linux-aarch64-shared-cpu sherpa-onnx-v2.0.1-linux-aarch64-shared-lib sherpa-onnx-v2.0.1-linux-aarch64-shared"
+    if [ "$desired_mode" = "gpu" ]; then
+      sherpa_candidates="sherpa-onnx-v2.0.1-linux-aarch64-shared-gpu-onnxruntime-1.18.1 sherpa-onnx-v2.0.1-linux-aarch64-shared-gpu-onnxruntime-1.18.0 sherpa-onnx-v2.0.1-linux-aarch64-shared-cpu"
+    else
+      sherpa_candidates="sherpa-onnx-v2.0.1-linux-aarch64-shared-cpu sherpa-onnx-v2.0.1-linux-aarch64-shared-lib sherpa-onnx-v2.0.1-linux-aarch64-shared"
+    fi
     ;;
   Linux-x86_64)
-    sherpa_candidates="sherpa-onnx-v2.0.1-linux-x64-shared-cpu sherpa-onnx-v2.0.1-linux-x64-shared-lib sherpa-onnx-v2.0.1-linux-x64-shared"
+    if [ "$desired_mode" = "gpu" ]; then
+      sherpa_candidates="sherpa-onnx-v2.0.1-linux-x64-shared-gpu-onnxruntime-1.18.1 sherpa-onnx-v2.0.1-linux-x64-shared-cpu"
+    else
+      sherpa_candidates="sherpa-onnx-v2.0.1-linux-x64-shared-cpu sherpa-onnx-v2.0.1-linux-x64-shared-lib sherpa-onnx-v2.0.1-linux-x64-shared"
+    fi
     ;;
   *)
     echo "This script targets Linux (aarch64/x86_64). Current platform: $os_arch" >&2
@@ -26,14 +39,20 @@ case "$os_arch" in
     ;;
 esac
 
-mkdir -p .build/native-deps
+mkdir -p .build/native-deps/sherpa
 download() {
   [ -f "$2" ] && return
   curl --fail --location --retry 3 "$1" --output "$2.part"
   mv "$2.part" "$2"
 }
 
-if [ ! -f .build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so ]; then
+installed_mode=""
+if [ -f .build/native-deps/sherpa/.mode ]; then
+  installed_mode="$(cat .build/native-deps/sherpa/.mode)"
+fi
+
+if [ ! -f .build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so ] || [ "$installed_mode" != "$desired_mode" ]; then
+  rm -rf .build/native-deps/sherpa/lib .build/native-deps/sherpa/include/onnxruntime .build/sherpa-linux.tar.bz2
   downloaded_dir=""
   for candidate in $sherpa_candidates; do
     url="https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$candidate.tar.bz2"
@@ -50,13 +69,32 @@ if [ ! -f .build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so ]; then
   tar -xjf .build/sherpa-linux.tar.bz2 -C .build
   mkdir -p .build/native-deps/sherpa/lib
   cp -a ".build/$downloaded_dir/lib/"*.so* .build/native-deps/sherpa/lib/
+  printf '%s\n' "$downloaded_dir" > .build/native-deps/sherpa/.archive
+  printf '%s' "$desired_mode" > .build/native-deps/sherpa/.mode
 fi
 
 include=.build/native-deps/sherpa/include
 mkdir -p "$include/sherpa-onnx/c-api" "$include/onnxruntime/core/session"
 download https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.1/sherpa-onnx/c-api/c-api.h "$include/sherpa-onnx/c-api/c-api.h"
-for header in onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h onnxruntime_error_code.h onnxruntime_ep_c_api.h; do
-  download "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.28.2/include/onnxruntime/core/session/$header" "$include/onnxruntime/core/session/$header"
+
+ort_tag="v1.28.2"
+ort_headers="onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h onnxruntime_error_code.h onnxruntime_ep_c_api.h"
+archive_name=""
+if [ -f .build/native-deps/sherpa/.archive ]; then
+  archive_name="$(cat .build/native-deps/sherpa/.archive)"
+fi
+case "$archive_name" in
+  *onnxruntime-1.18.1*)
+    ort_tag="v1.18.1"
+    ort_headers="onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h"
+    ;;
+  *onnxruntime-1.18.0*)
+    ort_tag="v1.18.0"
+    ort_headers="onnxruntime_c_api.h onnxruntime_cxx_api.h onnxruntime_cxx_inline.h onnxruntime_float16.h"
+    ;;
+esac
+for header in $ort_headers; do
+  download "https://raw.githubusercontent.com/microsoft/onnxruntime/$ort_tag/include/onnxruntime/core/session/$header" "$include/onnxruntime/core/session/$header"
 done
 
 echo "Linux native SDKs ready at $PWD/.build/native-deps/sherpa"

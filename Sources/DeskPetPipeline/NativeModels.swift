@@ -94,7 +94,12 @@ public final class NativeInferenceModel: @unchecked Sendable {
         guard ["router", "output"].contains(configuration.role), ["metal", "cuda"].contains(configuration.device) else {
             throw PipelineError("GPU_REQUIRED", stage: configuration.role)
         }
-        let span = performance?.begin(role: configuration.role, backend: configuration.backend, device: configuration.device, phase: "inference")
+        return try await enqueue(input, executor: executor, as: Output.self, measurement: "inference")
+    }
+    fileprivate func enqueue<Input: Encodable & Sendable, Output: Decodable & Sendable>(
+        _ input: Input, executor: GPUExecutor, as: Output.Type, measurement: String = "inference"
+    ) async throws -> Output {
+        let span = performance?.begin(role: configuration.role, backend: configuration.backend, device: configuration.device, phase: measurement)
         let operation = GPUOperation<Data> { [self] in
             let job = try submit(input)
             return GPUCompletion(cancel: { job.cancel() }, poll: { job.poll() })
@@ -313,14 +318,24 @@ public enum NativeRouterContract {
 
 public actor NativeStreamingSTT: StreamingSpeechRecognizer {
     private let model: NativeInferenceModel
+    private let executor: GPUExecutor?
     private struct Session { var pcm = Data(); var first: Date; var lastPartialBytes = 0 }
     private var sessions: [UUID: Session] = [:]
-    public init(model: NativeInferenceModel) { self.model = model }
+    public init(model: NativeInferenceModel, executor: GPUExecutor? = nil) {
+        self.model = model
+        self.executor = executor
+    }
     private func recognize(_ pcm: Data, start: Date, end: Date, final: Bool) async throws -> Transcript {
         struct Input: Encodable, Sendable { var pcm: String; var language = "ko" }
         struct Reply: Codable, Sendable { var text: String; var confidence: Double }
-        let result = try await model.run(Input(pcm: pcm.base64EncodedString()), as: Reply.self,
-                                         measurement: final ? "final" : "partial")
+        let input = Input(pcm: pcm.base64EncodedString())
+        let measurement = final ? "final" : "partial"
+        let result: Reply
+        if let executor {
+            result = try await model.enqueue(input, executor: executor, as: Reply.self, measurement: measurement)
+        } else {
+            result = try await model.run(input, as: Reply.self, measurement: measurement)
+        }
         if final && !result.text.isEmpty { await NativeConsole.value("stt", result) }
         return Transcript(text: result.text, isFinal: final, sttConfidence: result.confidence,
                           audioStartedAt: start, audioEndedAt: end)
@@ -402,11 +417,21 @@ public struct NativeEmotionClassifier: EmotionClassifier {
 
 public struct NativeSpeechSynthesizer: SpeechSynthesizer {
     public let model: NativeInferenceModel
-    public init(model: NativeInferenceModel) { self.model = model }
+    private let executor: GPUExecutor?
+    public init(model: NativeInferenceModel, executor: GPUExecutor? = nil) {
+        self.model = model
+        self.executor = executor
+    }
     public func audio(for event: OutputEvent) async throws -> any AudioSource {
         struct Input: Encodable, Sendable { var text: String }
         struct Reply: Decodable, Sendable { var pcm: String; var sampleRate: Int }
-        let r = try await model.run(Input(text: event.text), as: Reply.self)
+        let input = Input(text: event.text)
+        let r: Reply
+        if let executor {
+            r = try await model.enqueue(input, executor: executor, as: Reply.self)
+        } else {
+            r = try await model.run(input, as: Reply.self)
+        }
         guard let data = Data(base64Encoded: r.pcm), !data.isEmpty, data.count <= 32_000_000 else {
             throw PipelineError("TTS_ERROR", stage: "tts")
         }

@@ -334,12 +334,15 @@ enum JetsonLauncher {
         let repository = ["owner": String(repo[0]), "name": String(repo[1])]
         let target = Target(kind: "github_pr", entityId: "\(repo.joined(separator: "/"))#\(number)", name: "PR \(number)", repository: repository, prNumber: number)
         let harness = try ServerHarness(url: url, token: token, performance: performance)
-        let recognizer: any SpeechRecognizer = keyboard ? KeyboardOnlyRecognizer() : NativeStreamingSTT(model: loaded["stt"]!)
+        let audioExecutor = ProcessInfo.processInfo.environment["DESKPET_USE_AUDIO_GPU"] == "1" ? gpu : nil
+        let recognizer: any SpeechRecognizer = keyboard ? KeyboardOnlyRecognizer()
+            : NativeStreamingSTT(model: loaded["stt"]!, executor: audioExecutor)
         var adapters = Adapters(stt: recognizer,
             router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
             output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
-            tts: NativeSpeechSynthesizer(model: loaded["tts"]!), speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
+            tts: NativeSpeechSynthesizer(model: loaded["tts"]!, executor: audioExecutor),
+            speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
             adapters.taskRefs = [HarnessTaskRef(itemId: item, stageId: stage, repository: repository, prNumber: number)]
