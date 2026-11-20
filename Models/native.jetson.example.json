@@ -16,13 +16,13 @@
     }, "contextTokens": 512, "maxTokens": 128, "threads": 4 },
     "vad": { "backend": "sherpa-onnx", "role": "vad", "device": "cpu", "paths": { "model": "vad/silero_vad.onnx" }, "contextTokens": 0, "maxTokens": 0, "threads": 1 },
     "emotion": { "backend": "onnxruntime", "role": "emotion", "device": "cpu", "paths": { "model": "emotion/model.onnx", "tokenizer": "emotion/tokenizer.json" }, "contextTokens": 0, "maxTokens": 0, "threads": 2 },
-    "tts": { "backend": "tensorrt", "role": "tts", "device": "cuda", "paths": {
-      "text_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/text_embed.engine",
-      "codec_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/codec_embed.engine",
-      "residual_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/residual_embed.engine",
-      "talker": "tts/qwen3-tts-12hz-0.6b-customvoice/talker_cache.engine",
-      "code_predictor": "tts/qwen3-tts-12hz-0.6b-customvoice/code_predictor.engine",
-      "tok_decoder": "tts/qwen3-tts-12hz-0.6b-customvoice/tok_decoder.engine",
+    "tts": { "backend": "onnxruntime", "role": "tts", "device": "cpu", "paths": {
+      "text_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/text_embed.onnx",
+      "codec_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/codec_embed.onnx",
+      "residual_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/residual_embed.onnx",
+      "talker": "tts/qwen3-tts-12hz-0.6b-customvoice/talker_cache.onnx",
+      "code_predictor": "tts/qwen3-tts-12hz-0.6b-customvoice/code_predictor.onnx",
+      "tok_decoder": "tts/qwen3-tts-12hz-0.6b-customvoice/tok_decoder.onnx",
       "config": "tts/qwen3-tts-12hz-0.6b-customvoice/config.json",
       "vocab": "tts/qwen3-tts-12hz-0.6b-customvoice/vocab.json",
       "merges": "tts/qwen3-tts-12hz-0.6b-customvoice/merges.txt"

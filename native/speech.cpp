@@ -19,12 +19,6 @@
 #if defined(DESKPET_HAS_TOKENIZERS_CPP)
 #include <tokenizers_cpp.h>
 #endif
-#if defined(DESKPET_HAS_TENSORRT)
-#include <NvInfer.h>
-#include <NvOnnxParser.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#endif
 namespace {
 std::string trim_whitespace(const std::string &s) {
     size_t a = 0, b = s.size();
@@ -182,22 +176,7 @@ public:
         }catch(...){SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);throw;}
     }
 };
-#if defined(DESKPET_HAS_TENSORRT) && defined(DESKPET_HAS_TOKENIZERS_CPP)
-inline void speech_check_cuda(cudaError_t err,const char *what) {
-    require(err==cudaSuccess,std::string(what)+": "+cudaGetErrorString(err));
-}
-class SpeechTrtLogger final : public nvinfer1::ILogger {
-public:
-    void log(Severity severity,const char *msg) noexcept override {
-        if(severity<=Severity::kERROR) std::fprintf(stderr,"[TensorRT/TTS] %s\n",msg);
-    }
-} g_speech_trt_logger;
-
-struct SpeechTrtDeleter {
-    template <typename T> void operator()(T *obj) const noexcept { delete obj; }
-};
-template <typename T> using SpeechTrtPtr=std::unique_ptr<T,SpeechTrtDeleter>;
-
+#if defined(DESKPET_HAS_TOKENIZERS_CPP)
 static std::string read_text_file(const std::string &path) {
     std::ifstream f(path,std::ios::binary);
     require(bool(f),"FILE_NOT_FOUND: "+path);
@@ -238,201 +217,126 @@ static bool natural_name_less(const std::string &a,const std::string &b) {
     if(na!=nb) return na<nb;
     return a<b;
 }
-static size_t trt_dtype_bytes(nvinfer1::DataType dt) {
-    switch(dt) {
-        case nvinfer1::DataType::kFLOAT: return 4;
-        case nvinfer1::DataType::kHALF: return 2;
-        case nvinfer1::DataType::kINT32: return 4;
-        case nvinfer1::DataType::kINT64: return 8;
-        case nvinfer1::DataType::kINT8:
-        case nvinfer1::DataType::kUINT8:
-        case nvinfer1::DataType::kBOOL: return 1;
-        default: return 4;
-    }
-}
-static size_t dims_numel(const nvinfer1::Dims &d) {
-    size_t n=1;
-    for(int i=0;i<d.nbDims;++i) n*=static_cast<size_t>(std::max<int64_t>(0,d.d[i]));
-    return n;
-}
 
-struct CudaDeviceBuffer {
-    void *ptr=nullptr;
-    size_t capacity=0;
-    ~CudaDeviceBuffer(){reset();}
-    CudaDeviceBuffer()=default;
-    CudaDeviceBuffer(const CudaDeviceBuffer &)=delete;
-    CudaDeviceBuffer &operator=(const CudaDeviceBuffer &)=delete;
-    CudaDeviceBuffer(CudaDeviceBuffer &&o) noexcept:ptr(o.ptr),capacity(o.capacity){o.ptr=nullptr;o.capacity=0;}
-    CudaDeviceBuffer &operator=(CudaDeviceBuffer &&o) noexcept {
-        if(this!=&o){reset();ptr=o.ptr;capacity=o.capacity;o.ptr=nullptr;o.capacity=0;}
-        return *this;
-    }
-    void ensure(size_t bytes) {
-        if(bytes<=capacity&&ptr) return;
-        reset();
-        size_t alloc=std::max<size_t>(bytes,256);
-        speech_check_cuda(cudaMalloc(&ptr,alloc),"cudaMalloc Qwen3TTS");
-        capacity=alloc;
-    }
-    void reset(){if(ptr){cudaFree(ptr);ptr=nullptr;capacity=0;}}
-};
+struct OrtModule {
+    Ort::Session session{nullptr};
+    std::vector<std::string> in_names, out_names;
+    std::vector<const char *> in_cstrs, out_cstrs;
+    std::unordered_map<std::string,size_t> in_idx, out_idx;
+    std::vector<ONNXTensorElementDataType> in_dtypes, out_dtypes;
+    std::vector<std::vector<int64_t>> in_shapes, out_shapes;
 
-struct TrtModule {
-    SpeechTrtPtr<nvinfer1::ICudaEngine> engine;
-    SpeechTrtPtr<nvinfer1::IExecutionContext> context;
-    struct TensorInfo {
-        std::string name;
-        nvinfer1::TensorIOMode mode;
-        nvinfer1::DataType dtype;
-        nvinfer1::Dims shape;
-        CudaDeviceBuffer buf;
-    };
-    std::vector<TensorInfo> tensors;
-    std::unordered_map<std::string,size_t> by_name;
-    std::vector<size_t> input_indices;
-    std::vector<size_t> output_indices;
-
-    void load_or_build(nvinfer1::IRuntime *runtime,const std::string &configured_path,
-                       const std::function<void(nvinfer1::INetworkDefinition *,nvinfer1::IOptimizationProfile *)> &configure_profile,
-                       bool allow_fp16) {
-        std::string engine_path=configured_path;
-        std::string onnx_path=swap_suffix(configured_path,".engine",".onnx");
-        if(configured_path.size()>=5&&configured_path.compare(configured_path.size()-5,5,".onnx")==0) {
-            onnx_path=configured_path;
-            engine_path=swap_suffix(configured_path,".onnx",".engine");
+    void load(Ort::Env &env,const std::string &configured_path,const std::string &device,int threads) {
+        std::string onnx_path=configured_path;
+        if(configured_path.size()>=7&&configured_path.compare(configured_path.size()-7,7,".engine")==0) {
+            std::string cand=swap_suffix(configured_path,".engine",".onnx");
+            if(speech_file_exists(cand)) onnx_path=cand;
         }
-        if(speech_file_exists(engine_path)) {
-            std::ifstream f(engine_path,std::ios::binary|std::ios::ate);
-            require(bool(f),"TTS_ENGINE_READ_FAILED: "+engine_path);
-            auto sz=f.tellg();require(sz>0,"TTS_ENGINE_EMPTY: "+engine_path);
-            std::vector<char> bytes(static_cast<size_t>(sz));
-            f.seekg(0,std::ios::beg);f.read(bytes.data(),sz);
-            engine.reset(runtime->deserializeCudaEngine(bytes.data(),bytes.size()));
-        } else if(speech_file_exists(onnx_path)) {
-            SpeechTrtPtr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(g_speech_trt_logger));
-            require(bool(builder),"TTS_TRT_BUILDER_FAILED");
-            SpeechTrtPtr<nvinfer1::INetworkDefinition> net(builder->createNetworkV2(
-                1U<<static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH)));
-            SpeechTrtPtr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*net,g_speech_trt_logger));
-            require(parser->parseFromFile(onnx_path.c_str(),static_cast<int>(nvinfer1::ILogger::Severity::kWARNING)),
-                    "TTS_ONNX_PARSE_FAILED: "+onnx_path);
-            SpeechTrtPtr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
-            if(allow_fp16) cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
-            cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE,512ULL<<20);
-            auto *profile=builder->createOptimizationProfile();
-            configure_profile(net.get(),profile);
-            cfg->addOptimizationProfile(profile);
-            SpeechTrtPtr<nvinfer1::IHostMemory> plan(builder->buildSerializedNetwork(*net,*cfg));
-            require(bool(plan),"TTS_TRT_BUILD_FAILED: "+onnx_path);
-            std::string tmp=engine_path+".tmp";
-            {
-                std::ofstream out(tmp,std::ios::binary|std::ios::trunc);
-                if(out) out.write(reinterpret_cast<const char *>(plan->data()),static_cast<std::streamsize>(plan->size()));
-            }
-            std::rename(tmp.c_str(),engine_path.c_str());
-            engine.reset(runtime->deserializeCudaEngine(plan->data(),plan->size()));
-        } else {
-            require(false,"TTS_MODEL_MISSING: "+configured_path);
-        }
-        require(bool(engine),"TTS_ENGINE_INIT_FAILED: "+engine_path);
-        context.reset(engine->createExecutionContext());
-        require(bool(context),"TTS_CONTEXT_INIT_FAILED: "+engine_path);
+        require(speech_file_exists(onnx_path),"TTS_MODEL_MISSING: "+configured_path);
 
-        int nb_io=engine->getNbIOTensors();
-        tensors.resize(static_cast<size_t>(nb_io));
-        for(int i=0;i<nb_io;++i) {
-            const char *name=engine->getIOTensorName(i);
-            auto &t=tensors[static_cast<size_t>(i)];
-            t.name=name;
-            t.mode=engine->getTensorIOMode(name);
-            t.dtype=engine->getTensorDataType(name);
-            t.shape=engine->getTensorShape(name);
-            by_name[t.name]=static_cast<size_t>(i);
-            if(t.mode==nvinfer1::TensorIOMode::kINPUT) input_indices.push_back(static_cast<size_t>(i));
-            else output_indices.push_back(static_cast<size_t>(i));
+        Ort::SessionOptions options;
+        options.SetIntraOpNumThreads(threads);
+        options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        if(device=="cuda") {
+            OrtCUDAProviderOptions cuda_opts{};
+            cuda_opts.cudnn_conv_algo_search=OrtCudnnConvAlgoSearchHeuristic;
+            options.AppendExecutionProvider_CUDA(cuda_opts);
         }
+        session=Ort::Session(env,onnx_path.c_str(),options);
+
+        Ort::AllocatorWithDefaultOptions allocator;
+        size_t n_in=session.GetInputCount();
+        in_names.reserve(n_in); in_cstrs.reserve(n_in); in_dtypes.reserve(n_in); in_shapes.reserve(n_in);
+        for(size_t i=0;i<n_in;++i) {
+            in_names.emplace_back(session.GetInputNameAllocated(i,allocator).get());
+            in_idx[in_names.back()]=i;
+            auto info=session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+            in_dtypes.push_back(info.GetElementType());
+            in_shapes.push_back(info.GetShape());
+        }
+        for(const auto &name:in_names) in_cstrs.push_back(name.c_str());
+
+        size_t n_out=session.GetOutputCount();
+        out_names.reserve(n_out); out_cstrs.reserve(n_out); out_dtypes.reserve(n_out); out_shapes.reserve(n_out);
+        for(size_t i=0;i<n_out;++i) {
+            out_names.emplace_back(session.GetOutputNameAllocated(i,allocator).get());
+            out_idx[out_names.back()]=i;
+            auto info=session.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
+            out_dtypes.push_back(info.GetElementType());
+            out_shapes.push_back(info.GetShape());
+        }
+        for(const auto &name:out_names) out_cstrs.push_back(name.c_str());
     }
 
-    TensorInfo &require_tensor(const std::string &name) {
-        auto it=by_name.find(name);
-        require(it!=by_name.end(),"TTS_TRT_MISSING_TENSOR: "+name);
-        return tensors[it->second];
+    size_t require_input(const std::string &name) const {
+        auto it=in_idx.find(name);
+        require(it!=in_idx.end(),"TTS_ORT_MISSING_INPUT: "+name);
+        return it->second;
     }
-    void set_input_ints(const std::string &name,const nvinfer1::Dims &dims,const std::vector<int64_t> &vals,cudaStream_t stream) {
-        auto &t=require_tensor(name);
-        size_t n=dims_numel(dims);
-        require(vals.size()==n,"TTS_INT_INPUT_SIZE_MISMATCH: "+name);
-        require(context->setInputShape(t.name.c_str(),dims),"TTS_SET_INPUT_SHAPE_FAILED: "+name);
-        t.buf.ensure(n*trt_dtype_bytes(t.dtype));
-        if(n>0) {
-            if(t.dtype==nvinfer1::DataType::kINT64) {
-                speech_check_cuda(cudaMemcpyAsync(t.buf.ptr,vals.data(),n*sizeof(int64_t),cudaMemcpyHostToDevice,stream),"cudaMemcpyH2D int64");
-            } else {
-                require(t.dtype==nvinfer1::DataType::kINT32,"TTS_UNEXPECTED_INT_DTYPE: "+name);
-                std::vector<int32_t> i32(n);
-                for(size_t i=0;i<n;++i) i32[i]=static_cast<int32_t>(vals[i]);
-                speech_check_cuda(cudaMemcpyAsync(t.buf.ptr,i32.data(),n*sizeof(int32_t),cudaMemcpyHostToDevice,stream),"cudaMemcpyH2D int32");
-            }
+    size_t require_output(const std::string &name) const {
+        auto it=out_idx.find(name);
+        require(it!=out_idx.end(),"TTS_ORT_MISSING_OUTPUT: "+name);
+        return it->second;
+    }
+
+    static Ort::Value make_int_tensor(const OrtMemoryInfo *mem,ONNXTensorElementDataType dt,
+                                      const std::vector<int64_t> &shape,const std::vector<int64_t> &vals,
+                                      std::vector<std::vector<int32_t>> &i32_scratch) {
+        if(dt==ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+            return Ort::Value::CreateTensor<int64_t>(mem,const_cast<int64_t *>(vals.data()),vals.size(),shape.data(),shape.size());
         }
-        require(context->setTensorAddress(t.name.c_str(),t.buf.ptr),"TTS_SET_IN_ADDR_FAILED: "+name);
+        require(dt==ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,"TTS_UNEXPECTED_INT_DTYPE");
+        i32_scratch.emplace_back(vals.size());
+        auto &buf=i32_scratch.back();
+        for(size_t i=0;i<vals.size();++i) buf[i]=static_cast<int32_t>(vals[i]);
+        return Ort::Value::CreateTensor<int32_t>(mem,buf.data(),buf.size(),shape.data(),shape.size());
     }
-    void set_input_floats(const std::string &name,const nvinfer1::Dims &dims,const std::vector<float> &vals,cudaStream_t stream) {
-        auto &t=require_tensor(name);
-        size_t n=dims_numel(dims);
-        require(vals.size()==n,"TTS_FLOAT_INPUT_SIZE_MISMATCH: "+name);
-        require(context->setInputShape(t.name.c_str(),dims),"TTS_SET_INPUT_SHAPE_FAILED: "+name);
-        t.buf.ensure(n*trt_dtype_bytes(t.dtype));
-        if(n>0) {
-            if(t.dtype==nvinfer1::DataType::kFLOAT) {
-                speech_check_cuda(cudaMemcpyAsync(t.buf.ptr,vals.data(),n*sizeof(float),cudaMemcpyHostToDevice,stream),"cudaMemcpyH2D fp32");
-            } else {
-                require(t.dtype==nvinfer1::DataType::kHALF,"TTS_UNEXPECTED_FLOAT_DTYPE: "+name);
-                std::vector<__half> f16(n);
-                for(size_t i=0;i<n;++i) f16[i]=__float2half(vals[i]);
-                speech_check_cuda(cudaMemcpyAsync(t.buf.ptr,f16.data(),n*sizeof(__half),cudaMemcpyHostToDevice,stream),"cudaMemcpyH2D fp16");
-            }
+
+    static Ort::Value make_float_tensor(const OrtMemoryInfo *mem,ONNXTensorElementDataType dt,
+                                        const std::vector<int64_t> &shape,const std::vector<float> &vals,
+                                        std::vector<std::vector<Ort::Float16_t>> &f16_scratch) {
+        if(dt==ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            return Ort::Value::CreateTensor<float>(mem,const_cast<float *>(vals.data()),vals.size(),shape.data(),shape.size());
         }
-        require(context->setTensorAddress(t.name.c_str(),t.buf.ptr),"TTS_SET_IN_ADDR_FAILED: "+name);
+        require(dt==ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,"TTS_UNEXPECTED_FLOAT_DTYPE");
+        f16_scratch.emplace_back(vals.size());
+        auto &buf=f16_scratch.back();
+        for(size_t i=0;i<vals.size();++i) buf[i]=Ort::Float16_t(vals[i]);
+        return Ort::Value::CreateTensor<Ort::Float16_t>(mem,buf.data(),buf.size(),shape.data(),shape.size());
     }
-    void prepare_outputs_and_run(cudaStream_t stream) {
-        for(size_t idx:output_indices) {
-            auto &t=tensors[idx];
-            auto dims=context->getTensorShape(t.name.c_str());
-            for(int d=0;d<dims.nbDims;++d) require(dims.d[d]>=0,"TTS_OUTPUT_DIM_UNRESOLVED: "+t.name);
-            t.buf.ensure(dims_numel(dims)*trt_dtype_bytes(t.dtype));
-            require(context->setTensorAddress(t.name.c_str(),t.buf.ptr),"TTS_SET_OUT_ADDR_FAILED: "+t.name);
-        }
-        require(context->enqueueV3(stream),"TTS_TRT_ENQUEUE_FAILED");
-    }
-    std::vector<float> read_output_floats(const std::string &name,cudaStream_t stream,nvinfer1::Dims *out_dims=nullptr) {
-        auto &t=require_tensor(name);
-        auto dims=context->getTensorShape(t.name.c_str());
-        if(out_dims) *out_dims=dims;
-        size_t n=dims_numel(dims);
+
+    static std::vector<float> read_floats(const Ort::Value &val,std::vector<int64_t> *out_shape=nullptr) {
+        auto info=val.GetTensorTypeAndShapeInfo();
+        auto shape=info.GetShape();
+        if(out_shape) *out_shape=shape;
+        size_t n=info.GetElementCount();
         std::vector<float> out(n);
         if(n==0) return out;
-        if(t.dtype==nvinfer1::DataType::kFLOAT) {
-            speech_check_cuda(cudaMemcpyAsync(out.data(),t.buf.ptr,n*sizeof(float),cudaMemcpyDeviceToHost,stream),"cudaMemcpyD2H fp32");
-            speech_check_cuda(cudaStreamSynchronize(stream),"cudaStreamSync fp32");
+        auto dt=info.GetElementType();
+        if(dt==ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            const float *src=val.GetTensorData<float>();
+            std::memcpy(out.data(),src,n*sizeof(float));
         } else {
-            require(t.dtype==nvinfer1::DataType::kHALF,"TTS_UNEXPECTED_OUT_DTYPE: "+name);
-            std::vector<__half> f16(n);
-            speech_check_cuda(cudaMemcpyAsync(f16.data(),t.buf.ptr,n*sizeof(__half),cudaMemcpyDeviceToHost,stream),"cudaMemcpyD2H fp16");
-            speech_check_cuda(cudaStreamSynchronize(stream),"cudaStreamSync fp16");
-            for(size_t i=0;i<n;++i) out[i]=__half2float(f16[i]);
+            require(dt==ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,"TTS_UNEXPECTED_OUT_DTYPE");
+            const Ort::Float16_t *src=val.GetTensorData<Ort::Float16_t>();
+            for(size_t i=0;i<n;++i) out[i]=static_cast<float>(src[i]);
         }
         return out;
     }
+
+    std::vector<Ort::Value> run_all(const std::vector<Ort::Value> &inputs) {
+        return session.Run(Ort::RunOptions{nullptr},in_cstrs.data(),inputs.data(),inputs.size(),
+                           out_cstrs.data(),out_cstrs.size());
+    }
 };
 
-class Qwen3TTSTrtModel final : public Model {
-    SpeechTrtPtr<nvinfer1::IRuntime> runtime;
-    cudaStream_t stream=nullptr;
-    TrtModule text_embed, codec_embed, residual_embed, talker, code_predictor, tok_decoder;
+class Qwen3TTSOnnxModel final : public Model {
+    Ort::Env env{ORT_LOGGING_LEVEL_ERROR,"deskpet_tts"};
+    OrtModule text_embed, codec_embed, residual_embed, talker, code_predictor, tok_decoder;
     std::unique_ptr<tokenizers::Tokenizer> tokenizer;
     json cfg;
     int64_t hidden_size=1024, vocab_size=3072, n_groups=16;
+    int64_t n_kv=8, head_dim=128;
     int64_t im_start_id=151644, assistant_id=77091, newline_id=198;
     int64_t tts_bos_id=151672, tts_eos_id=151673, tts_pad_id=151671;
     int64_t codec_bos_id=2149, codec_eos_id=2150, codec_pad_id=2148;
@@ -441,9 +345,7 @@ class Qwen3TTSTrtModel final : public Model {
     int max_new_tokens=2048;
 
     bool has_kv_cache=false;
-    int kv_min_past=0;
     std::vector<std::string> past_names, present_names;
-    std::vector<CudaDeviceBuffer> kv_past_bufs;
 
     static int sample_token(const float *logits,int64_t vocab,bool do_sample,int top_k,double top_p,double temperature,std::mt19937_64 &rng) {
         if(!do_sample||temperature<=0.0) {
@@ -482,43 +384,55 @@ class Qwen3TTSTrtModel final : public Model {
         return items.back().second;
     }
 
-    std::vector<float> embed_text(const std::vector<int64_t> &ids) {
-        nvinfer1::Dims2 d{1,static_cast<int64_t>(ids.size())};
-        text_embed.set_input_ints("text_ids",d,ids,stream);
-        text_embed.prepare_outputs_and_run(stream);
-        return text_embed.read_output_floats("text_embeds",stream);
+    std::vector<float> embed_text(const OrtMemoryInfo *mem,const std::vector<int64_t> &ids) {
+        std::vector<Ort::Value> ins(text_embed.in_names.size());
+        std::vector<std::vector<int32_t>> i32;
+        size_t idx=text_embed.require_input("text_ids");
+        ins[idx]=OrtModule::make_int_tensor(mem,text_embed.in_dtypes[idx],{1,static_cast<int64_t>(ids.size())},ids,i32);
+        auto outs=text_embed.run_all(ins);
+        return OrtModule::read_floats(outs[text_embed.require_output("text_embeds")]);
     }
-    std::vector<float> embed_codec(const std::vector<int64_t> &ids) {
-        nvinfer1::Dims2 d{1,static_cast<int64_t>(ids.size())};
-        codec_embed.set_input_ints("codec_ids",d,ids,stream);
-        codec_embed.prepare_outputs_and_run(stream);
-        return codec_embed.read_output_floats("codec_embeds",stream);
+    std::vector<float> embed_codec(const OrtMemoryInfo *mem,const std::vector<int64_t> &ids) {
+        std::vector<Ort::Value> ins(codec_embed.in_names.size());
+        std::vector<std::vector<int32_t>> i32;
+        size_t idx=codec_embed.require_input("codec_ids");
+        ins[idx]=OrtModule::make_int_tensor(mem,codec_embed.in_dtypes[idx],{1,static_cast<int64_t>(ids.size())},ids,i32);
+        auto outs=codec_embed.run_all(ins);
+        return OrtModule::read_floats(outs[codec_embed.require_output("codec_embeds")]);
     }
-    std::vector<float> run_residual_embed(const std::vector<int64_t> &codes16) {
-        nvinfer1::Dims2 d{1,n_groups};
-        residual_embed.set_input_ints("codec_ids",d,codes16,stream);
-        residual_embed.prepare_outputs_and_run(stream);
-        return residual_embed.read_output_floats("step_embed",stream);
+    std::vector<float> run_residual_embed(const OrtMemoryInfo *mem,const std::vector<int64_t> &codes16) {
+        std::vector<Ort::Value> ins(residual_embed.in_names.size());
+        std::vector<std::vector<int32_t>> i32;
+        size_t idx=residual_embed.require_input("codec_ids");
+        ins[idx]=OrtModule::make_int_tensor(mem,residual_embed.in_dtypes[idx],{1,n_groups},codes16,i32);
+        auto outs=residual_embed.run_all(ins);
+        return OrtModule::read_floats(outs[residual_embed.require_output("step_embed")]);
     }
-    std::vector<float> run_code_predictor(const std::vector<float> &last_hidden,const std::vector<int64_t> &codes16,nvinfer1::Dims &out_dims) {
-        code_predictor.set_input_floats("talker_hidden",nvinfer1::Dims2{1,hidden_size},last_hidden,stream);
-        code_predictor.set_input_ints("codec_ids",nvinfer1::Dims2{1,n_groups},codes16,stream);
-        code_predictor.prepare_outputs_and_run(stream);
-        return code_predictor.read_output_floats("group_logits",stream,&out_dims);
+    std::vector<float> run_code_predictor(const OrtMemoryInfo *mem,const std::vector<float> &last_hidden,
+                                          const std::vector<int64_t> &codes16,std::vector<int64_t> &out_dims) {
+        std::vector<Ort::Value> ins(code_predictor.in_names.size());
+        std::vector<std::vector<int32_t>> i32;
+        std::vector<std::vector<Ort::Float16_t>> f16;
+        size_t ih=code_predictor.require_input("talker_hidden");
+        size_t ic=code_predictor.require_input("codec_ids");
+        ins[ih]=OrtModule::make_float_tensor(mem,code_predictor.in_dtypes[ih],{1,hidden_size},last_hidden,f16);
+        ins[ic]=OrtModule::make_int_tensor(mem,code_predictor.in_dtypes[ic],{1,n_groups},codes16,i32);
+        auto outs=code_predictor.run_all(ins);
+        return OrtModule::read_floats(outs[code_predictor.require_output("group_logits")],&out_dims);
     }
 
 public:
-    explicit Qwen3TTSTrtModel(const json &c):Model(c) {
-        require(c.at("device")=="cuda","TTS_TENSORRT_REQUIRES_CUDA");
-        speech_check_cuda(cudaStreamCreate(&stream),"cudaStreamCreate Qwen3TTS");
-        runtime.reset(nvinfer1::createInferRuntime(g_speech_trt_logger));
-        require(bool(runtime),"TTS_TRT_RUNTIME_FAILED");
+    explicit Qwen3TTSOnnxModel(const json &c):Model(c) {
+        std::string dev=c.at("device").get<std::string>();
+        require(dev=="cpu"||dev=="cuda","TTS_DEVICE_UNSUPPORTED");
 
         cfg=read_json(path("config"));
         const auto &tc=cfg.at("talker_config");
         hidden_size=tc.at("hidden_size").get<int64_t>();
         vocab_size=tc.at("vocab_size").get<int64_t>();
         n_groups=tc.at("num_code_groups").get<int64_t>();
+        n_kv=tc.value("num_key_value_heads",8);
+        head_dim=tc.value("head_dim",128);
         im_start_id=cfg.at("im_start_token_id").get<int64_t>();
         assistant_id=cfg.at("assistant_token_id").get<int64_t>();
         tts_bos_id=cfg.at("tts_bos_token_id").get<int64_t>();
@@ -560,117 +474,56 @@ public:
         require(!nl.empty(),"TTS_NEWLINE_TOKEN_FAILED");
         newline_id=nl[0];
 
-        auto seq2d_profile=[](nvinfer1::INetworkDefinition *net,nvinfer1::IOptimizationProfile *p) {
-            for(int i=0;i<net->getNbInputs();++i) {
-                auto *in=net->getInput(i);auto dims=in->getDimensions();
-                if(dims.nbDims==2&&dims.d[1]<0) {
-                    p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kMIN,nvinfer1::Dims2{1,1});
-                    p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kOPT,nvinfer1::Dims2{1,32});
-                    p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kMAX,nvinfer1::Dims2{1,512});
-                }
-            }
-        };
-        auto batch1_profile=[](nvinfer1::INetworkDefinition *net,nvinfer1::IOptimizationProfile *p) {
-            for(int i=0;i<net->getNbInputs();++i) {
-                auto *in=net->getInput(i);auto dims=in->getDimensions();
-                nvinfer1::Dims fixed=dims;
-                for(int d=0;d<fixed.nbDims;++d) if(fixed.d[d]<0) fixed.d[d]=1;
-                p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kMIN,fixed);
-                p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kOPT,fixed);
-                p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kMAX,fixed);
-            }
-        };
-        int64_t n_kv=tc.value("num_key_value_heads",8), head_dim=tc.value("head_dim",128), H=hidden_size;
-        auto talker_profile=[H,n_kv,head_dim,this](nvinfer1::INetworkDefinition *net,nvinfer1::IOptimizationProfile *p) {
-            int max_tot=std::min(4096,max_new_tokens+512);
-            for(int i=0;i<net->getNbInputs();++i) {
-                auto *in=net->getInput(i);const char *name=in->getName();auto dims=in->getDimensions();
-                if(std::strcmp(name,"inputs_embeds")==0) {
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMIN,nvinfer1::Dims3{1,1,H});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kOPT,nvinfer1::Dims3{1,1,H});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMAX,nvinfer1::Dims3{1,512,H});
-                } else if(std::strcmp(name,"position_ids")==0) {
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMIN,nvinfer1::Dims3{3,1,1});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kOPT,nvinfer1::Dims3{3,1,1});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMAX,nvinfer1::Dims3{3,1,512});
-                } else if(std::strcmp(name,"attention_mask")==0) {
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMIN,nvinfer1::Dims2{1,1});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kOPT,nvinfer1::Dims2{1,64});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMAX,nvinfer1::Dims2{1,max_tot});
-                } else if(dims.nbDims==4) {
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMIN,nvinfer1::Dims4{1,n_kv,1,head_dim});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kOPT,nvinfer1::Dims4{1,n_kv,64,head_dim});
-                    p->setDimensions(name,nvinfer1::OptProfileSelector::kMAX,nvinfer1::Dims4{1,n_kv,max_tot,head_dim});
-                }
-            }
-        };
-        auto decoder_profile=[](nvinfer1::INetworkDefinition *net,nvinfer1::IOptimizationProfile *p) {
-            for(int i=0;i<net->getNbInputs();++i) {
-                auto *in=net->getInput(i);
-                nvinfer1::Dims3 fixed{1,25,16};
-                p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kMIN,fixed);
-                p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kOPT,fixed);
-                p->setDimensions(in->getName(),nvinfer1::OptProfileSelector::kMAX,fixed);
-            }
-        };
+        int threads=c.value("threads",2);
+        text_embed.load(env,path("text_embed"),dev,threads);
+        codec_embed.load(env,path("codec_embed"),dev,threads);
+        residual_embed.load(env,path("residual_embed"),dev,threads);
+        talker.load(env,path("talker"),dev,threads);
+        code_predictor.load(env,path("code_predictor"),dev,threads);
+        tok_decoder.load(env,path("tok_decoder"),dev,threads);
 
-        text_embed.load_or_build(runtime.get(),path("text_embed"),seq2d_profile,true);
-        codec_embed.load_or_build(runtime.get(),path("codec_embed"),seq2d_profile,true);
-        residual_embed.load_or_build(runtime.get(),path("residual_embed"),batch1_profile,true);
-        talker.load_or_build(runtime.get(),path("talker"),talker_profile,true);
-        code_predictor.load_or_build(runtime.get(),path("code_predictor"),batch1_profile,true);
-        // tok_decoder stays FP32 (audio codec quantization degrades waveform quality).
-        tok_decoder.load_or_build(runtime.get(),path("tok_decoder"),decoder_profile,false);
-
-        for(size_t idx:talker.input_indices) {
-            const auto &t=talker.tensors[idx];
-            if(t.name!="inputs_embeds"&&t.name!="position_ids"&&t.name!="attention_mask") past_names.push_back(t.name);
+        for(const auto &name:talker.in_names) {
+            if(name!="inputs_embeds"&&name!="position_ids"&&name!="attention_mask") past_names.push_back(name);
         }
-        for(size_t idx:talker.output_indices) {
-            const auto &t=talker.tensors[idx];
-            if(t.name!="logits"&&t.name!="hidden_states") present_names.push_back(t.name);
+        for(const auto &name:talker.out_names) {
+            if(name!="logits"&&name!="hidden_states") present_names.push_back(name);
         }
         has_kv_cache=!past_names.empty();
         if(has_kv_cache) {
             require(past_names.size()==present_names.size(),"TTS_KV_TENSOR_MISMATCH");
             std::sort(past_names.begin(),past_names.end(),natural_name_less);
             std::sort(present_names.begin(),present_names.end(),natural_name_less);
-            auto min_dims=talker.engine->getProfileShape(past_names[0].c_str(),0,nvinfer1::OptProfileSelector::kMIN);
-            kv_min_past=static_cast<int>(std::max<int64_t>(0,min_dims.d[2]));
-            kv_past_bufs.resize(past_names.size());
         }
     }
-    ~Qwen3TTSTrtModel() override {
-        stop();
-        kv_past_bufs.clear();
-        if(stream) cudaStreamDestroy(stream);
-    }
+    ~Qwen3TTSOnnxModel() override { stop(); }
 
     json infer(Job &job) override {
         auto text=job.input.at("text").get<std::string>();
         require(!text.empty()&&text.size()<=8192,"TTS_TEXT_LIMIT");
         require(!job.cancelled.load(),"CANCELLED");
 
+        auto mem=Ort::MemoryInfo::CreateCpu(OrtArenaAllocator,OrtMemTypeDefault);
+
         // 0) Tokenize text and fetch fixed special token embeddings.
         auto body_raw=tokenizer->Encode(text);
         require(!body_raw.empty(),"TTS_EMPTY_TOKENS");
         std::vector<int64_t> body_ids(body_raw.begin(),body_raw.end());
 
-        auto spec=embed_text({tts_bos_id,tts_eos_id,tts_pad_id});
+        auto spec=embed_text(mem,{tts_bos_id,tts_eos_id,tts_pad_id});
         std::vector<float> bos_e(spec.begin(),spec.begin()+hidden_size);
         std::vector<float> eos_e(spec.begin()+hidden_size,spec.begin()+2*hidden_size);
         std::vector<float> pad_e(spec.begin()+2*hidden_size,spec.begin()+3*hidden_size);
-        auto role=embed_text({im_start_id,assistant_id,newline_id});
+        auto role=embed_text(mem,{im_start_id,assistant_id,newline_id});
 
         // 1) Language + speaker + codec prefix embeddings.
         std::vector<int64_t> codec_prefill;
         if(language_id<0) codec_prefill={codec_nothink_id,codec_think_bos_id,codec_think_eos_id};
         else codec_prefill={codec_think_id,codec_think_bos_id,language_id,codec_think_eos_id};
-        auto codec0=embed_codec(codec_prefill);
-        auto codec1=embed_codec({codec_pad_id,codec_bos_id});
+        auto codec0=embed_codec(mem,codec_prefill);
+        auto codec1=embed_codec(mem,{codec_pad_id,codec_bos_id});
         std::vector<float> codec_input=std::move(codec0);
         if(speaker_id>=0) {
-            auto spk_e=embed_codec({speaker_id});
+            auto spk_e=embed_codec(mem,{speaker_id});
             codec_input.insert(codec_input.end(),spk_e.begin(),spk_e.end());
         }
         codec_input.insert(codec_input.end(),codec1.begin(),codec1.end());
@@ -685,8 +538,8 @@ public:
             }
         }
         std::vector<int64_t> pad_ids(body_ids.size()+1,codec_pad_id);
-        auto text_body=embed_text(body_ids);
-        auto codec_pads=embed_codec(pad_ids);
+        auto text_body=embed_text(mem,body_ids);
+        auto codec_pads=embed_codec(mem,pad_ids);
         for(size_t i=0;i<body_ids.size();++i) {
             for(int64_t h=0;h<hidden_size;++h) {
                 talker_in.push_back(text_body[i*hidden_size+h]+codec_pads[i*hidden_size+h]);
@@ -695,7 +548,7 @@ public:
         for(int64_t h=0;h<hidden_size;++h) {
             talker_in.push_back(eos_e[static_cast<size_t>(h)]+codec_pads[body_ids.size()*hidden_size+h]);
         }
-        auto codec_bos_e=embed_codec({codec_bos_id});
+        auto codec_bos_e=embed_codec(mem,{codec_bos_id});
         for(int64_t h=0;h<hidden_size;++h) {
             talker_in.push_back(pad_e[static_cast<size_t>(h)]+codec_bos_e[static_cast<size_t>(h)]);
         }
@@ -711,6 +564,14 @@ public:
         int64_t total_pos=0;
         int64_t kv_past_len=0;
         std::vector<float> cur_embeds=std::move(talker_in);
+        std::vector<Ort::Value> kv_past_vals;
+        std::vector<uint8_t> empty_kv_dummy(16,0);
+
+        size_t i_emb=talker.require_input("inputs_embeds");
+        size_t i_pos=talker.require_input("position_ids");
+        size_t i_msk=talker.require_input("attention_mask");
+        size_t o_log=talker.require_output("logits");
+        size_t o_hid=talker.require_output("hidden_states");
 
         for(int step=0;step<max_new_tokens;++step) {
             require(!job.cancelled.load(),"CANCELLED");
@@ -718,49 +579,49 @@ public:
             for(int row=0;row<3;++row) {
                 for(int64_t c=0;c<cur_seq;++c) pos[static_cast<size_t>(row*cur_seq+c)]=total_pos+c;
             }
-            int64_t mask_prefix=(has_kv_cache&&step==0)?kv_min_past:0;
-            int64_t kv_in_len=(step==0)?mask_prefix:kv_past_len;
+            int64_t kv_in_len=(step==0)?0:kv_past_len;
             int64_t mask_len=kv_in_len+cur_seq;
             std::vector<int64_t> mask(static_cast<size_t>(mask_len),1);
-            for(int64_t i=0;i<mask_prefix;++i) mask[static_cast<size_t>(i)]=0;
 
-            talker.set_input_floats("inputs_embeds",nvinfer1::Dims3{1,cur_seq,hidden_size},cur_embeds,stream);
-            talker.set_input_ints("position_ids",nvinfer1::Dims3{3,1,cur_seq},pos,stream);
-            talker.set_input_ints("attention_mask",nvinfer1::Dims2{1,mask_len},mask,stream);
+            std::vector<Ort::Value> talker_ins(talker.in_names.size());
+            std::vector<std::vector<int32_t>> i32;
+            std::vector<std::vector<Ort::Float16_t>> f16;
+            talker_ins[i_emb]=OrtModule::make_float_tensor(mem,talker.in_dtypes[i_emb],{1,cur_seq,hidden_size},cur_embeds,f16);
+            talker_ins[i_pos]=OrtModule::make_int_tensor(mem,talker.in_dtypes[i_pos],{3,1,cur_seq},pos,i32);
+            talker_ins[i_msk]=OrtModule::make_int_tensor(mem,talker.in_dtypes[i_msk],{1,mask_len},mask,i32);
 
             if(has_kv_cache) {
-                for(size_t k=0;k<past_names.size();++k) {
-                    auto &pt=talker.require_tensor(past_names[k]);
-                    nvinfer1::Dims kv_dims=pt.shape;
-                    kv_dims.d[0]=1;
-                    kv_dims.d[2]=kv_in_len;
-                    require(talker.context->setInputShape(pt.name.c_str(),kv_dims),"TTS_SET_KV_SHAPE_FAILED");
-                    size_t kv_bytes=dims_numel(kv_dims)*trt_dtype_bytes(pt.dtype);
-                    kv_past_bufs[k].ensure(kv_bytes);
-                    if(step==0&&kv_bytes>0) {
-                        speech_check_cuda(cudaMemsetAsync(kv_past_bufs[k].ptr,0,kv_bytes,stream),"cudaMemset kv0");
+                if(step==0) {
+                    kv_past_vals.clear();
+                    kv_past_vals.reserve(past_names.size());
+                    for(const auto &pname:past_names) {
+                        size_t pk=talker.require_input(pname);
+                        const auto &ps=talker.in_shapes[pk];
+                        int64_t kv_h=(ps.size()>=2&&ps[1]>0)?ps[1]:n_kv;
+                        int64_t kv_d=(ps.size()>=4&&ps[3]>0)?ps[3]:head_dim;
+                        std::vector<int64_t> kv_shape{1,kv_h,0,kv_d};
+                        kv_past_vals.push_back(Ort::Value::CreateTensor(
+                            mem,empty_kv_dummy.data(),0,kv_shape.data(),kv_shape.size(),talker.in_dtypes[pk]));
                     }
-                    require(talker.context->setTensorAddress(pt.name.c_str(),kv_past_bufs[k].ptr),"TTS_SET_KV_ADDR_FAILED");
+                }
+                for(size_t k=0;k<past_names.size();++k) {
+                    size_t pk=talker.require_input(past_names[k]);
+                    talker_ins[pk]=std::move(kv_past_vals[k]);
                 }
             }
 
-            talker.prepare_outputs_and_run(stream);
-
-            nvinfer1::Dims logits_dims{}, hidden_dims{};
-            auto logits=talker.read_output_floats("logits",stream,&logits_dims);
-            auto hidden=talker.read_output_floats("hidden_states",stream,&hidden_dims);
+            auto outputs=talker.run_all(talker_ins);
+            auto logits=OrtModule::read_floats(outputs[o_log]);
+            auto hidden=OrtModule::read_floats(outputs[o_hid]);
 
             if(has_kv_cache) {
-                auto pres_dims=talker.context->getTensorShape(present_names[0].c_str());
-                kv_past_len=pres_dims.d[2];
                 for(size_t k=0;k<present_names.size();++k) {
-                    const auto &pr=talker.require_tensor(present_names[k]);
-                    size_t copy_bytes=dims_numel(pr.shape.nbDims?talker.context->getTensorShape(pr.name.c_str()):pres_dims)*trt_dtype_bytes(pr.dtype);
-                    kv_past_bufs[k].ensure(copy_bytes);
-                    if(copy_bytes>0) {
-                        speech_check_cuda(cudaMemcpyAsync(kv_past_bufs[k].ptr,pr.buf.ptr,copy_bytes,cudaMemcpyDeviceToDevice,stream),"cudaMemcpyD2D kv");
-                    }
+                    size_t ok=talker.require_output(present_names[k]);
+                    kv_past_vals[k]=std::move(outputs[ok]);
                 }
+                auto pres_shape=kv_past_vals[0].GetTensorTypeAndShapeInfo().GetShape();
+                require(pres_shape.size()>=3,"TTS_KV_SHAPE_INVALID");
+                kv_past_len=pres_shape[2];
             }
 
             size_t last_off=static_cast<size_t>((cur_seq-1)*vocab_size);
@@ -783,15 +644,16 @@ public:
             std::vector<int64_t> codes16(static_cast<size_t>(n_groups),0);
             codes16[0]=code0;
             for(int64_t j=1;j<n_groups;++j) {
-                nvinfer1::Dims gdims{};
-                auto gl=run_code_predictor(last_hidden,codes16,gdims);
-                int64_t sub_vocab=gdims.d[2];
+                std::vector<int64_t> gdims;
+                auto gl=run_code_predictor(mem,last_hidden,codes16,gdims);
+                require(gdims.size()>=3,"TTS_CODE_PREDICTOR_SHAPE_INVALID");
+                int64_t sub_vocab=gdims[2];
                 const float *row_logits=gl.data()+static_cast<size_t>((j-1)*sub_vocab);
                 codes16[static_cast<size_t>(j)]=sample_token(row_logits,sub_vocab,true,top_k,top_p,temperature,rng);
             }
             all_codes.insert(all_codes.end(),codes16.begin(),codes16.end());
 
-            auto next_emb=run_residual_embed(codes16);
+            auto next_emb=run_residual_embed(mem,codes16);
             for(int64_t h=0;h<hidden_size;++h) next_emb[static_cast<size_t>(h)]+=pad_e[static_cast<size_t>(h)];
 
             if(has_kv_cache) {
@@ -812,6 +674,8 @@ public:
         // 4) Decode discrete 12Hz frames via fixed 25-frame tok_decoder chunks -> 24kHz PCM.
         constexpr int64_t DEC_FRAMES=25;
         std::vector<float> pcm_out;
+        size_t i_dec=tok_decoder.require_input("audio_codes");
+        size_t o_wav=tok_decoder.require_output("waveform");
         for(int64_t s=0;s<total_frames;s+=DEC_FRAMES) {
             require(!job.cancelled.load(),"CANCELLED");
             int64_t rem=std::min(DEC_FRAMES,total_frames-s);
@@ -822,9 +686,11 @@ public:
                             &all_codes[static_cast<size_t>(src_f*n_groups)],
                             static_cast<size_t>(n_groups)*sizeof(int64_t));
             }
-            tok_decoder.set_input_ints("audio_codes",nvinfer1::Dims3{1,DEC_FRAMES,n_groups},chunk,stream);
-            tok_decoder.prepare_outputs_and_run(stream);
-            auto wav=tok_decoder.read_output_floats("waveform",stream);
+            std::vector<Ort::Value> dec_ins(tok_decoder.in_names.size());
+            std::vector<std::vector<int32_t>> i32;
+            dec_ins[i_dec]=OrtModule::make_int_tensor(mem,tok_decoder.in_dtypes[i_dec],{1,DEC_FRAMES,n_groups},chunk,i32);
+            auto dec_outs=tok_decoder.run_all(dec_ins);
+            auto wav=OrtModule::read_floats(dec_outs[o_wav]);
             size_t keep=(rem<DEC_FRAMES)
                 ? static_cast<size_t>(std::max<int64_t>(0,std::llround(static_cast<double>(wav.size())*static_cast<double>(rem)/static_cast<double>(DEC_FRAMES))))
                 : wav.size();
@@ -889,15 +755,15 @@ std::shared_ptr<Model> make_speech_model(const json &c) {
     if(role=="stt"&&backend=="sherpa-onnx") return std::make_shared<Qwen3ASRModel>(c);
     if(role=="vad"&&backend=="sherpa-onnx") return std::make_shared<VADModel>(c);
     if(role=="tts"&&backend=="sherpa-onnx") return std::make_shared<TTSModel>(c);
-#if defined(DESKPET_HAS_TENSORRT) && defined(DESKPET_HAS_TOKENIZERS_CPP)
-    if(role=="tts"&&backend=="tensorrt") return std::make_shared<Qwen3TTSTrtModel>(c);
+#if defined(DESKPET_HAS_TOKENIZERS_CPP)
+    if(role=="tts"&&backend=="onnxruntime") return std::make_shared<Qwen3TTSOnnxModel>(c);
 #endif
     if(role=="emotion"&&backend=="onnxruntime") return std::make_shared<EmotionModel>(c);
 #endif
-    if(role=="tts"&&backend=="tensorrt") throw std::runtime_error("TENSORRT_TTS_NOT_AVAILABLE");
+    if(role=="tts"&&backend=="onnxruntime") throw std::runtime_error("ONNXRUNTIME_TTS_NOT_AVAILABLE");
     require((role=="stt"&&(backend=="sherpa-onnx"||backend=="whisper.cpp")) ||
             ((role=="vad"||role=="tts")&&backend=="sherpa-onnx") ||
-            (role=="tts"&&backend=="tensorrt") ||
+            (role=="tts"&&backend=="onnxruntime") ||
             (role=="emotion"&&backend=="onnxruntime"),"BACKEND_UNSUPPORTED");
     throw std::runtime_error("NATIVE_DEPENDENCY_MISSING: "+role);
 }
