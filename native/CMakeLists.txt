@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(DeskPetNative LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -38,6 +39,40 @@ if(SHERPA_ROOT)
   target_compile_definitions(deskpet_inference PRIVATE DESKPET_SPEECH=1)
   target_include_directories(deskpet_inference PRIVATE "${SHERPA_ROOT}/include" "${SHERPA_ROOT}/include/onnxruntime/core/session")
   target_link_libraries(deskpet_inference PRIVATE "${SHERPA_LIBRARY}" "${ORT_LIBRARY}")
+endif()
+option(DESKPET_TENSORRT_TTS "Enable TensorRT and tokenizers-cpp for Qwen3-TTS in speech.cpp" OFF)
+if(DESKPET_TENSORRT_TTS)
+  set(TOKENIZERS_CPP_DIR "${DESKPET_SOURCE_ROOT}/tokenizers-cpp")
+  if(NOT EXISTS "${TOKENIZERS_CPP_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "tokenizers-cpp not found at ${TOKENIZERS_CPP_DIR}; required for DESKPET_TENSORRT_TTS=ON")
+  endif()
+  set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${TOKENIZERS_CPP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/tokenizers-cpp" EXCLUDE_FROM_ALL)
+  find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+    HINTS /usr/include/aarch64-linux-gnu /usr/include/x86_64-linux-gnu /usr/local/cuda/include /usr/include
+    REQUIRED)
+  find_path(CUDA_INCLUDE_DIR cuda_runtime.h
+    HINTS /usr/local/cuda/include /usr/include/aarch64-linux-gnu /usr/include
+    REQUIRED)
+  find_library(NVINFER_LIB nvinfer
+    HINTS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64 /usr/lib
+    REQUIRED)
+  find_library(NVONNXPARSER_LIB nvonnxparser
+    HINTS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64 /usr/lib
+    REQUIRED)
+  find_library(CUDART_LIB cudart
+    HINTS /usr/local/cuda/lib64 /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib
+    REQUIRED)
+  target_compile_definitions(deskpet_inference PRIVATE DESKPET_HAS_TOKENIZERS_CPP=1 DESKPET_HAS_TENSORRT=1)
+  target_include_directories(deskpet_inference PRIVATE
+    "${TOKENIZERS_CPP_DIR}/include"
+    "${TENSORRT_INCLUDE_DIR}"
+    "${CUDA_INCLUDE_DIR}")
+  target_link_libraries(deskpet_inference PRIVATE
+    tokenizers_cpp
+    "${NVINFER_LIB}"
+    "${NVONNXPARSER_LIB}"
+    "${CUDART_LIB}")
 endif()
 option(DESKPET_PREP "Build offline checkpoint preparation tool (LibTorch required)" OFF)
 if(DESKPET_PREP)
