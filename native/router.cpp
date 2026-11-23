@@ -25,14 +25,43 @@ static std::pair<size_t,size_t> trimmed(const std::string &s) {
     size_t a=0,b=s.size();while(a<b&&white(s[a]))++a;while(b>a&&white(s[b-1]))--b;return {a,b};
 }
 struct HeadStore {
-    ggml_context *weights=nullptr; ggml_backend_buffer_t buffer=nullptr; ggml_backend_t backend;
+    ggml_context *weights=nullptr; std::vector<ggml_backend_buffer_t> buffers; ggml_backend_t backend;
     explicit HeadStore(const std::string &file,ggml_backend_t b):backend(b) {
         gguf_init_params params{true,&weights}; auto meta=gguf_init_from_file(file.c_str(),params);
         require(meta && weights,"INVALID_HEADS_GGUF");
         try {
-            for(int64_t i=0;i<gguf_get_n_tensors(meta);++i)
+            auto buft=ggml_backend_get_default_buffer_type(backend);
+            require(buft,"GPU_HEAD_ALLOCATION_FAILED");
+            const size_t align=ggml_backend_buft_get_alignment(buft);
+            std::vector<ggml_tensor *> small_tensors, large_tensors;
+            size_t small_bytes=0;
+            for(int64_t i=0;i<gguf_get_n_tensors(meta);++i) {
                 require(gguf_get_tensor_type(meta,i)==GGML_TYPE_F16,"HEADS_MUST_BE_FP16");
-            buffer=ggml_backend_alloc_ctx_tensors(weights,backend);require(buffer,"GPU_HEAD_ALLOCATION_FAILED");
+                auto t=ggml_get_tensor(weights,gguf_get_tensor_name(meta,i));
+                require(t,"INVALID_HEADS_GGUF");
+                size_t alloc_sz=ggml_backend_buft_get_alloc_size(buft,t);
+                if(alloc_sz>4*1024*1024) {
+                    large_tensors.push_back(t);
+                } else {
+                    size_t padded=((alloc_sz+align-1)/align)*align;
+                    small_bytes+=padded;
+                    small_tensors.push_back(t);
+                }
+            }
+            auto alloc_group=[&](const std::vector<ggml_tensor *> &group,size_t total_bytes) {
+                if(group.empty()) return;
+                auto buf=ggml_backend_buft_alloc_buffer(buft,std::max(total_bytes,align));
+                require(buf,"GPU_HEAD_ALLOCATION_FAILED");
+                buffers.push_back(buf);
+                auto talloc=ggml_tallocr_new(buf);
+                for(auto t:group) {
+                    require(ggml_tallocr_alloc(&talloc,t)==GGML_STATUS_SUCCESS,"GPU_HEAD_ALLOCATION_FAILED");
+                }
+            };
+            alloc_group(small_tensors,small_bytes+align);
+            for(auto t:large_tensors) {
+                alloc_group({t},ggml_backend_buft_get_alloc_size(buft,t));
+            }
             std::ifstream in(file,std::ios::binary);
             for(int64_t i=0;i<gguf_get_n_tensors(meta);++i) {
                 auto t=ggml_get_tensor(weights,gguf_get_tensor_name(meta,i));
@@ -42,9 +71,9 @@ struct HeadStore {
                     require(size_t(in.gcount())==count,"TRUNCATED_HEADS");ggml_backend_tensor_set(t,bytes.data(),offset,count);offset+=count;}
             }
             gguf_free(meta);
-        } catch(...) { gguf_free(meta);if(buffer)ggml_backend_buffer_free(buffer);ggml_free(weights);weights=nullptr;throw; }
+        } catch(...) { gguf_free(meta);for(auto buf:buffers)ggml_backend_buffer_free(buf);buffers.clear();ggml_free(weights);weights=nullptr;throw; }
     }
-    ~HeadStore(){if(buffer)ggml_backend_buffer_free(buffer);if(weights)ggml_free(weights);}
+    ~HeadStore(){for(auto buf:buffers)ggml_backend_buffer_free(buf);if(weights)ggml_free(weights);}
     Tensor *get(const std::string &name) { auto t=ggml_get_tensor(weights,name.c_str()); require(t,"MISSING_HEAD: "+name);return t; }
     std::vector<float> calculate(const std::vector<float> &values,int hidden,int tokens,
         const std::function<Tensor *(ggml_context *,Tensor *)> &build) {
