@@ -30,6 +30,25 @@ fetch_file() {
   mv "$dest.part" "$dest"
 }
 
+fetch_first_ok() {
+  dest=$1
+  shift
+  if [ -f "$dest" ] && [ -s "$dest" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  for url in "$@"; do
+    echo "[run.command] Downloading $(basename "$dest") ..."
+    if curl --fail --location --retry 2 "$url" --output "$dest.part" 2>/dev/null && [ -s "$dest.part" ]; then
+      mv "$dest.part" "$dest"
+      return 0
+    fi
+    rm -f "$dest.part"
+  done
+  echo "[run.command] Failed to download $dest" >&2
+  return 1
+}
+
 ensure_models() {
   if [ "$has_help" = "1" ] || [ "$has_config" = "1" ]; then
     return 0
@@ -69,6 +88,25 @@ ensure_models() {
       echo "[run.command] Extracting $tts_dir from Qwen3-Models.zip ..."
       unzip -oq "Qwen3-Models.zip" "Models/tts/qwen3-tts-12hz-0.6b-customvoice/*" -d "."
     fi
+    qwen_hf="https://huggingface.co/onnx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main"
+    qwen_orig="https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main"
+    fetch_first_ok "$tts_dir/config.json" "$qwen_hf/config.json" "$qwen_orig/config.json"
+    fetch_first_ok "$tts_dir/vocab.json" "$qwen_hf/vocab.json" "$qwen_orig/vocab.json"
+    fetch_first_ok "$tts_dir/merges.txt" "$qwen_hf/merges.txt" "$qwen_orig/merges.txt"
+    fetch_first_ok "$tts_dir/tok_decoder.onnx" \
+      "$qwen_hf/cuda_fp32/tok_decoder.onnx" \
+      "$qwen_hf/cpu_fp32/tok_decoder.onnx" \
+      "$qwen_hf/cuda_fp16/tok_decoder.onnx" \
+      "$qwen_hf/cpu_fp16/tok_decoder.onnx" \
+      "$qwen_hf/cpu_int4/tok_decoder.onnx" \
+      "$qwen_hf/tok_decoder.onnx"
+    for f in text_embed.onnx codec_embed.onnx residual_embed.onnx talker_cache.onnx code_predictor.onnx; do
+      fetch_first_ok "$tts_dir/$f" \
+        "$qwen_hf/cpu_fp16/$f" \
+        "$qwen_hf/cuda_fp16/$f" \
+        "$qwen_hf/cpu_int4/$f" \
+        "$qwen_hf/$f"
+    done
   fi
 }
 
