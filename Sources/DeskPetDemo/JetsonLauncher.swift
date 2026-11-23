@@ -334,16 +334,18 @@ enum JetsonLauncher {
         let repository = ["owner": String(repo[0]), "name": String(repo[1])]
         let target = Target(kind: "github_pr", entityId: "\(repo.joined(separator: "/"))#\(number)", name: "PR \(number)", repository: repository, prNumber: number)
         let harness = try ServerHarness(url: url, token: token, performance: performance)
-        let audioExecutor = ProcessInfo.processInfo.environment["DESKPET_USE_AUDIO_GPU"] == "1" ? gpu : nil
+        let sttExecutor = loaded["stt"]?.configuration.device != "cpu" ? gpu : nil
+        let ttsExecutor = loaded["tts"]?.configuration.device != "cpu" ? gpu : nil
+        let emotionExecutor = loaded["emotion"]?.configuration.device != "cpu" ? gpu : nil
         let recognizer: any SpeechRecognizer = keyboard ? KeyboardOnlyRecognizer()
-            : NativeStreamingSTT(model: loaded["stt"]!, executor: audioExecutor)
+            : NativeStreamingSTT(model: loaded["stt"]!, executor: sttExecutor)
         var adapters = Adapters(stt: recognizer,
             router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
             output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
-            tts: NativeSpeechSynthesizer(model: loaded["tts"]!, executor: audioExecutor),
+            tts: NativeSpeechSynthesizer(model: loaded["tts"]!, executor: ttsExecutor),
             speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
-        adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
+        adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!, executor: emotionExecutor)
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
             adapters.taskRefs = [HarnessTaskRef(itemId: item, stageId: stage, repository: repository, prNumber: number)]
         }

@@ -11,6 +11,7 @@ public struct NativeModelConfiguration: Codable, Sendable {
     public var contextTokens: Int = 2048
     public var maxTokens: Int = 128
     public var threads: Int = 2
+    public var streaming: Bool?
     public init(backend: String = "llama.cpp", role: String, device: String, paths: [String: String]) {
         self.backend = backend; self.role = role; self.device = device; self.paths = paths
     }
@@ -385,12 +386,21 @@ public struct NativeVAD: ResettableVoiceActivityDetector {
 
 public struct NativeEmotionClassifier: EmotionClassifier {
     public let model: NativeInferenceModel
-    public init(model: NativeInferenceModel) { self.model = model }
+    private let executor: GPUExecutor?
+    public init(model: NativeInferenceModel, executor: GPUExecutor? = nil) {
+        self.model = model
+        self.executor = executor
+    }
     public func emotion(for text: String) async throws -> String {
         struct Input: Encodable, Sendable { var text: String; var words: [String] }
         struct Reply: Decodable, Sendable { var positive: Double }
         let normalized = text.precomposedStringWithCanonicalMapping
-        let r = try await model.run(Input(text: normalized, words: Self.words(normalized)), as: Reply.self)
+        let r: Reply
+        if let executor {
+            r = try await model.enqueue(Input(text: normalized, words: Self.words(normalized)), executor: executor, as: Reply.self)
+        } else {
+            r = try await model.run(Input(text: normalized, words: Self.words(normalized)), as: Reply.self)
+        }
         return r.positive >= 0.8 ? "cheerful" : r.positive <= 0.2 ? "sad" : "neutral"
     }
     /// BertNormalizer(clean_text=true, lowercase=false, strip_accents=false)

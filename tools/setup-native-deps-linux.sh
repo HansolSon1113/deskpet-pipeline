@@ -12,26 +12,19 @@ if [ "${1:-}" = "--install-apt" ]; then
     libcurl4-openssl-dev libxml2-dev
 fi
 
-desired_mode="cpu"
-if [ "${DESKPET_USE_AUDIO_GPU:-0}" = "1" ] || [ "${SHERPA_ONNX_USE_GPU:-0}" = "1" ]; then
-  desired_mode="gpu"
+desired_mode="gpu"
+if [ "${DESKPET_USE_AUDIO_GPU:-1}" = "0" ] && [ "${SHERPA_ONNX_USE_GPU:-0}" != "1" ]; then
+  echo "DESKPET_USE_AUDIO_GPU=0 is disabled: GPU-only mode requires CUDA." >&2
+  exit 1
 fi
 
 os_arch="$(uname -s)-$(uname -m)"
 case "$os_arch" in
   Linux-aarch64|Linux-arm64)
-    if [ "$desired_mode" = "gpu" ]; then
-      sherpa_candidates="sherpa-onnx-v2.0.1-linux-aarch64-shared-gpu-onnxruntime-1.18.1 sherpa-onnx-v2.0.1-linux-aarch64-shared-gpu-onnxruntime-1.18.0 sherpa-onnx-v2.0.1-linux-aarch64-shared-cpu"
-    else
-      sherpa_candidates="sherpa-onnx-v2.0.1-linux-aarch64-shared-cpu sherpa-onnx-v2.0.1-linux-aarch64-shared-lib sherpa-onnx-v2.0.1-linux-aarch64-shared"
-    fi
+    sherpa_candidates="sherpa-onnx-v2.0.1-linux-aarch64-shared-gpu-onnxruntime-1.18.1 sherpa-onnx-v2.0.1-linux-aarch64-shared-gpu-onnxruntime-1.18.0"
     ;;
   Linux-x86_64)
-    if [ "$desired_mode" = "gpu" ]; then
-      sherpa_candidates="sherpa-onnx-v2.0.1-linux-x64-shared-gpu-onnxruntime-1.18.1 sherpa-onnx-v2.0.1-linux-x64-shared-cpu"
-    else
-      sherpa_candidates="sherpa-onnx-v2.0.1-linux-x64-shared-cpu sherpa-onnx-v2.0.1-linux-x64-shared-lib sherpa-onnx-v2.0.1-linux-x64-shared"
-    fi
+    sherpa_candidates="sherpa-onnx-v2.0.1-linux-x64-shared-gpu-onnxruntime-1.18.1"
     ;;
   *)
     echo "This script targets Linux (aarch64/x86_64). Current platform: $os_arch" >&2

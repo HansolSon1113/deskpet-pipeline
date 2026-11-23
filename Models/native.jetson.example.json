@@ -8,20 +8,20 @@
   "models": {
     "router": { "backend": "llama.cpp", "role": "router", "device": "cuda", "paths": { "model": "router/backbone-merged-q4_0.gguf", "heads": "router/heads-f16.gguf", "config": "router/router_config.json", "chat_template": "router/tokenizer/chat_template.jinja" }, "contextTokens": 2560, "maxTokens": 128, "threads": 2 },
     "output": { "backend": "llama.cpp", "role": "output", "device": "cuda", "paths": { "model": "output/qwen-2b-q4_0.gguf" }, "contextTokens": 2048, "maxTokens": 128, "threads": 2 },
-    "stt": { "backend": "sherpa-onnx", "role": "stt", "device": "cpu", "paths": {
-      "conv_frontend": "stt/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/conv_frontend.onnx",
-      "encoder": "stt/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/encoder.int8.onnx",
-      "decoder": "stt/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/decoder.int8.onnx",
-      "tokenizer": "stt/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/tokenizer"
-    }, "contextTokens": 512, "maxTokens": 128, "threads": 4 },
-    "vad": { "backend": "sherpa-onnx", "role": "vad", "device": "cpu", "paths": { "model": "vad/silero_vad.onnx" }, "contextTokens": 0, "maxTokens": 0, "threads": 1 },
-    "emotion": { "backend": "onnxruntime", "role": "emotion", "device": "cpu", "paths": { "model": "emotion/model.onnx", "tokenizer": "emotion/tokenizer.json" }, "contextTokens": 0, "maxTokens": 0, "threads": 2 },
-    "tts": { "backend": "onnxruntime", "role": "tts", "device": "cpu", "paths": {
-      "text_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/text_embed.onnx",
-      "codec_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/codec_embed.onnx",
-      "residual_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/residual_embed.onnx",
-      "talker": "tts/qwen3-tts-12hz-0.6b-customvoice/talker_cache.onnx",
-      "code_predictor": "tts/qwen3-tts-12hz-0.6b-customvoice/code_predictor.onnx",
+    "stt": { "backend": "sherpa-onnx", "role": "stt", "device": "cuda", "paths": {
+      "encoder": "stt/sherpa-onnx-zipformer-korean-2024-06-24/encoder-epoch-99-avg-1.int8.onnx",
+      "decoder": "stt/sherpa-onnx-zipformer-korean-2024-06-24/decoder-epoch-99-avg-1.onnx",
+      "joiner": "stt/sherpa-onnx-zipformer-korean-2024-06-24/joiner-epoch-99-avg-1.int8.onnx",
+      "tokens": "stt/sherpa-onnx-zipformer-korean-2024-06-24/tokens.txt"
+    }, "contextTokens": 0, "maxTokens": 0, "threads": 4 },
+    "vad": { "backend": "sherpa-onnx", "role": "vad", "device": "cuda", "paths": { "model": "vad/silero_vad.onnx" }, "contextTokens": 0, "maxTokens": 0, "threads": 1 },
+    "emotion": { "backend": "onnxruntime", "role": "emotion", "device": "cuda", "paths": { "model": "emotion/model.onnx", "tokenizer": "emotion/tokenizer.json" }, "contextTokens": 0, "maxTokens": 0, "threads": 2 },
+    "tts": { "backend": "onnxruntime", "role": "tts", "device": "cuda", "paths": {
+      "text_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/cuda_int4/text_embed.onnx",
+      "codec_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/cuda_int4/codec_embed.onnx",
+      "residual_embed": "tts/qwen3-tts-12hz-0.6b-customvoice/cuda_int4/residual_embed.onnx",
+      "talker": "tts/qwen3-tts-12hz-0.6b-customvoice/cuda_int4/talker_cache.onnx",
+      "code_predictor": "tts/qwen3-tts-12hz-0.6b-customvoice/cuda_int4/code_predictor.onnx",
       "tok_decoder": "tts/qwen3-tts-12hz-0.6b-customvoice/tok_decoder.onnx",
       "config": "tts/qwen3-tts-12hz-0.6b-customvoice/config.json",
       "vocab": "tts/qwen3-tts-12hz-0.6b-customvoice/vocab.json",

@@ -141,13 +141,14 @@ struct NativeDemo {
         let harness = try ServerHarness(url: url, token: token, performance: performance)
         let recognizer: any SpeechRecognizer
         if keyboard { recognizer = KeyboardOnlyRecognizer() }
-        else { recognizer = NativeStreamingSTT(model: loaded["stt"]!) }
+        else { recognizer = NativeStreamingSTT(model: loaded["stt"]!, executor: loaded["stt"]?.configuration.device == "cpu" ? nil : gpu) }
         var adapters = Adapters(stt: recognizer,
             router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
             output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
-            tts: NativeSpeechSynthesizer(model: loaded["tts"]!), speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
-        adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!)
+            tts: NativeSpeechSynthesizer(model: loaded["tts"]!, executor: loaded["tts"]?.configuration.device == "cpu" ? nil : gpu),
+            speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
+        adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!, executor: loaded["emotion"]?.configuration.device == "cpu" ? nil : gpu)
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
             adapters.taskRefs = [HarnessTaskRef(itemId: item, stageId: stage, repository: repository, prNumber: number)]
         }
