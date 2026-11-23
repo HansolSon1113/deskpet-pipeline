@@ -146,12 +146,21 @@ enum ProjectLauncher {
             process.standardInput = input
             try process.run(); children.add(name, process); return process
         }
+        var reuseExistingHardware = false
+        if let socket, files.fileExists(atPath: socket) {
+            if let client = try? await HardwareClient.connect(path: socket) {
+                client.close()
+                reuseExistingHardware = true
+            } else {
+                try? files.removeItem(atPath: socket)
+            }
+        }
         do {
             if !options.contains("--no-build") {
                 if libraries.contains(nativeLibrary) {
                     try await command("네이티브 모델 연결 빌드", ["sh", "tools/build-native.sh", "-DDESKPET_PREP=OFF"], directory: root)
                 }
-                if socket != nil {
+                if socket != nil, !reuseExistingHardware {
                     var configure = ["sh", "tools/configure-hardware.sh", hardware.path, hardware.appendingPathComponent("build").path]
                     if options.contains("--headless") { configure.append("--headless") }
                     try await command("하드웨어 모의 화면 준비", configure, directory: root)
@@ -163,17 +172,29 @@ enum ProjectLauncher {
             }
             for path in libraries where !files.fileExists(atPath: path) { throw fault("BACKEND_LIBRARY_MISSING", path) }
             if let socket {
-                if files.fileExists(atPath: socket) { throw fault("HARDWARE_ALREADY_RUNNING", "기존 모의 화면을 종료한 뒤 다시 실행하세요: \(socket)") }
-                var args = [hardware.appendingPathComponent("build/deskpet-hardware").path, "--config", "config/mock.json", "--socket", socket]
-                if options.contains("--headless") { args.append("--headless") }
-                let process = try start("hardware", args, directory: hardware)
-                let until = ContinuousClock.now.advanced(by: .seconds(15))
-                while true {
-                    guard process.isRunning, ContinuousClock.now < until, !children.cancelled else { throw fault("HARDWARE_START_FAILED", "모의 화면을 시작하지 못했습니다. 로그: \(logs.path)") }
-                    if files.fileExists(atPath: socket), let client = try? await HardwareClient.connect(path: socket) {
-                        client.close(); break
+                if reuseExistingHardware {
+                    print("기존 하드웨어 데몬에 연결합니다: \(socket)")
+                } else if files.fileExists(atPath: socket) {
+                    if let client = try? await HardwareClient.connect(path: socket) {
+                        client.close()
+                        reuseExistingHardware = true
+                        print("기존 하드웨어 데몬에 연결합니다: \(socket)")
+                    } else {
+                        try? files.removeItem(atPath: socket)
                     }
-                    try await Task.sleep(for: .milliseconds(100))
+                }
+                if !reuseExistingHardware {
+                    var args = [hardware.appendingPathComponent("build/deskpet-hardware").path, "--config", "config/mock.json", "--socket", socket]
+                    if options.contains("--headless") { args.append("--headless") }
+                    let process = try start("hardware", args, directory: hardware)
+                    let until = ContinuousClock.now.advanced(by: .seconds(15))
+                    while true {
+                        guard process.isRunning, ContinuousClock.now < until, !children.cancelled else { throw fault("HARDWARE_START_FAILED", "모의 화면을 시작하지 못했습니다. 로그: \(logs.path)") }
+                        if files.fileExists(atPath: socket), let client = try? await HardwareClient.connect(path: socket) {
+                            client.close(); break
+                        }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
                 }
             }
             var serverArgs = ["node", "--import", "tsx", "scripts/server.ts"]

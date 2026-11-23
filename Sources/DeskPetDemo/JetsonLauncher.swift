@@ -175,6 +175,15 @@ enum JetsonLauncher {
 
         let realHardware = options.contains("--real-hardware")
         let headless = options.contains("--headless")
+        var reuseExistingHardware = false
+        if let socket, files.fileExists(atPath: socket) {
+            if let client = try? await HardwareClient.connect(path: socket) {
+                client.close()
+                reuseExistingHardware = true
+            } else {
+                try? files.removeItem(atPath: socket)
+            }
+        }
         do {
             if !options.contains("--no-build") {
                 let sherpaSo = root.appendingPathComponent(".build/native-deps/sherpa/lib/libsherpa-onnx-c-api.so").path
@@ -184,7 +193,7 @@ enum JetsonLauncher {
                 if libraries.contains(nativeLibrarySo) || libraries.contains(nativeLibraryDylib) {
                     try await command("Jetson 네이티브 모델 연결 빌드 (CUDA)", ["sh", "tools/build-native-linux.sh", "-DDESKPET_PREP=OFF"], directory: root)
                 }
-                if socket != nil {
+                if socket != nil, !reuseExistingHardware {
                     var configure = ["sh", "tools/configure-hardware-linux.sh", hardware.path, hardware.appendingPathComponent("build").path]
                     if realHardware && headless { configure.append("--real-headless") }
                     else if realHardware { configure.append("--real") }
@@ -199,24 +208,36 @@ enum JetsonLauncher {
             for path in libraries where !files.fileExists(atPath: path) { throw fault("BACKEND_LIBRARY_MISSING", path) }
 
             if let socket {
-                if files.fileExists(atPath: socket) {
-                    throw fault("HARDWARE_ALREADY_RUNNING", "기존 하드웨어 프로세스를 종료한 뒤 다시 실행하세요: \(socket)")
-                }
-                let hwConfig = realHardware ? "config/jetson.json" : "config/mock.json"
-                var args = [hardware.appendingPathComponent("build/deskpet-hardware").path, "--config", hwConfig, "--socket", socket]
-                if headless { args.append("--headless") }
-                let process = try start("hardware", args, directory: hardware)
-                let until = ContinuousClock.now.advanced(by: .seconds(15))
-                while true {
-                    guard process.isRunning, ContinuousClock.now < until, !children.cancelled else {
-                        throw fault("HARDWARE_START_FAILED", "하드웨어 데몬을 시작하지 못했습니다. 로그: \(logs.path)")
+                if reuseExistingHardware {
+                    print("기존 하드웨어 데몬에 연결합니다: \(socket)")
+                } else {
+                    if files.fileExists(atPath: socket) {
+                        if let client = try? await HardwareClient.connect(path: socket) {
+                            client.close()
+                            reuseExistingHardware = true
+                            print("기존 하드웨어 데몬에 연결합니다: \(socket)")
+                        } else {
+                            try? files.removeItem(atPath: socket)
+                        }
                     }
-                    if files.fileExists(atPath: socket), let client = try? await HardwareClient.connect(path: socket) {
-                        client.close(); break
-                    }
-                    try await Task.sleep(for: .milliseconds(100))
                 }
-                print(realHardware ? "Jetson 하드웨어 데몬 준비 완료" : "하드웨어 모의 화면 준비 완료")
+                if !reuseExistingHardware {
+                    let hwConfig = realHardware ? "config/jetson.json" : "config/mock.json"
+                    var args = [hardware.appendingPathComponent("build/deskpet-hardware").path, "--config", hwConfig, "--socket", socket]
+                    if headless { args.append("--headless") }
+                    let process = try start("hardware", args, directory: hardware)
+                    let until = ContinuousClock.now.advanced(by: .seconds(15))
+                    while true {
+                        guard process.isRunning, ContinuousClock.now < until, !children.cancelled else {
+                            throw fault("HARDWARE_START_FAILED", "하드웨어 데몬을 시작하지 못했습니다. 로그: \(logs.path)")
+                        }
+                        if files.fileExists(atPath: socket), let client = try? await HardwareClient.connect(path: socket) {
+                            client.close(); break
+                        }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    print(realHardware ? "Jetson 하드웨어 데몬 준비 완료" : "하드웨어 모의 화면 준비 완료")
+                }
             }
 
             var serverArgs = ["node", "--import", "tsx", "scripts/server.ts"]
