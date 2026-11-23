@@ -449,6 +449,13 @@ struct OrtModule {
         return out;
     }
 
+    std::vector<Ort::Value> make_input_slots() const {
+        std::vector<Ort::Value> slots;
+        slots.reserve(in_names.size());
+        for(size_t i=0;i<in_names.size();++i) slots.emplace_back(nullptr);
+        return slots;
+    }
+
     std::vector<Ort::Value> run_all(const std::vector<Ort::Value> &inputs) {
         return session.Run(Ort::RunOptions{nullptr},in_cstrs.data(),inputs.data(),inputs.size(),
                            out_cstrs.data(),out_cstrs.size());
@@ -759,7 +766,7 @@ class MeloTTSOnnxModel final : public Model {
         int64_t seq=static_cast<int64_t>(input_ids.size());
         std::vector<int64_t> mask(static_cast<size_t>(seq),1), types(static_cast<size_t>(seq),0);
         auto mem=Ort::MemoryInfo::CreateCpu(OrtArenaAllocator,OrtMemTypeDefault);
-        std::vector<Ort::Value> ins(bert.in_names.size());
+        auto ins=bert.make_input_slots();
         std::vector<std::vector<int32_t>> i32;
         for(size_t i=0;i<bert.in_names.size();++i) {
             const auto &n=bert.in_names[i];
@@ -843,7 +850,7 @@ public:
         std::vector<float> noise_scale{0.6f}, length_scale{1.0f}, noise_scale_w{0.8f}, sdp_ratio{0.2f};
 
         auto mem=Ort::MemoryInfo::CreateCpu(OrtArenaAllocator,OrtMemTypeDefault);
-        std::vector<Ort::Value> ins(melo.in_names.size());
+        auto ins=melo.make_input_slots();
         std::vector<std::vector<int32_t>> i32;
         std::vector<std::vector<Ort::Float16_t>> f16;
 
@@ -1151,7 +1158,7 @@ class Qwen3TTSOnnxModel final : public Model {
     }
 
     std::vector<float> embed_text(const OrtMemoryInfo *mem,const std::vector<int64_t> &ids) {
-        std::vector<Ort::Value> ins(text_embed.in_names.size());
+        auto ins=text_embed.make_input_slots();
         std::vector<std::vector<int32_t>> i32;
         size_t idx=text_embed.require_input("text_ids");
         ins[idx]=OrtModule::make_int_tensor(mem,text_embed.in_dtypes[idx],{1,static_cast<int64_t>(ids.size())},ids,i32);
@@ -1159,7 +1166,7 @@ class Qwen3TTSOnnxModel final : public Model {
         return OrtModule::read_floats(outs[text_embed.require_output("text_embeds")]);
     }
     std::vector<float> embed_codec(const OrtMemoryInfo *mem,const std::vector<int64_t> &ids) {
-        std::vector<Ort::Value> ins(codec_embed.in_names.size());
+        auto ins=codec_embed.make_input_slots();
         std::vector<std::vector<int32_t>> i32;
         size_t idx=codec_embed.require_input("codec_ids");
         ins[idx]=OrtModule::make_int_tensor(mem,codec_embed.in_dtypes[idx],{1,static_cast<int64_t>(ids.size())},ids,i32);
@@ -1167,7 +1174,7 @@ class Qwen3TTSOnnxModel final : public Model {
         return OrtModule::read_floats(outs[codec_embed.require_output("codec_embeds")]);
     }
     std::vector<float> run_residual_embed(const OrtMemoryInfo *mem,const std::vector<int64_t> &codes16) {
-        std::vector<Ort::Value> ins(residual_embed.in_names.size());
+        auto ins=residual_embed.make_input_slots();
         std::vector<std::vector<int32_t>> i32;
         size_t idx=residual_embed.require_input("codec_ids");
         ins[idx]=OrtModule::make_int_tensor(mem,residual_embed.in_dtypes[idx],{1,n_groups},codes16,i32);
@@ -1176,7 +1183,7 @@ class Qwen3TTSOnnxModel final : public Model {
     }
     std::vector<float> run_code_predictor(const OrtMemoryInfo *mem,const std::vector<float> &last_hidden,
                                           const std::vector<int64_t> &codes16,std::vector<int64_t> &out_dims) {
-        std::vector<Ort::Value> ins(code_predictor.in_names.size());
+        auto ins=code_predictor.make_input_slots();
         std::vector<std::vector<int32_t>> i32;
         std::vector<std::vector<Ort::Float16_t>> f16;
         size_t ih=code_predictor.require_input("talker_hidden");
@@ -1362,7 +1369,7 @@ public:
             std::vector<int64_t> mask(static_cast<size_t>(mask_len),1);
             if(pad_initial_kv&&mask_len>0) mask[0]=0;
 
-            std::vector<Ort::Value> talker_ins(talker.in_names.size());
+            auto talker_ins=talker.make_input_slots();
             std::vector<std::vector<int32_t>> i32;
             std::vector<std::vector<Ort::Float16_t>> f16;
             talker_ins[i_emb]=OrtModule::make_float_tensor(mem,talker.in_dtypes[i_emb],{1,cur_seq,hidden_size},cur_embeds,f16);
@@ -1468,7 +1475,7 @@ public:
                             &all_codes[static_cast<size_t>(src_f*n_groups)],
                             static_cast<size_t>(n_groups)*sizeof(int64_t));
             }
-            std::vector<Ort::Value> dec_ins(tok_decoder.in_names.size());
+            auto dec_ins=tok_decoder.make_input_slots();
             std::vector<std::vector<int32_t>> i32;
             dec_ins[i_dec]=OrtModule::make_int_tensor(mem,tok_decoder.in_dtypes[i_dec],{1,DEC_FRAMES,n_groups},chunk,i32);
             auto dec_outs=tok_decoder.run_all(dec_ins);

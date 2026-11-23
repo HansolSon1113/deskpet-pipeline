@@ -731,6 +731,310 @@ private enum OnnxQuantizer {
         try files.moveItem(at: partURL, to: dstURL)
         print("[configure-mac-json.swift] Quantized: \(srcPath) -> \(dstPath) (INT4=\(int4Count), FP16=\(fp16Count), \(out.count / (1024 * 1024)) MiB)")
     }
+
+    private static func valueInfoInputName(_ vi: Data) throws -> String? {
+        var pos = vi.startIndex
+        while pos < vi.endIndex {
+            let tag = try readVarint(vi, &pos)
+            let field = tag >> 3
+            let wire = tag & 0x7
+            if field == 1 && wire == 2 {
+                let len = Int(try readVarint(vi, &pos))
+                guard pos + len <= vi.endIndex else { throw NSError(domain: "OnnxQuantizer", code: 30) }
+                let s = String(data: vi[pos..<(pos + len)], encoding: .utf8)
+                return s
+            } else {
+                _ = try skipField(vi, &pos, wire: wire)
+            }
+        }
+        return nil
+    }
+
+    private static func valueInfoRank(_ vi: Data) throws -> Int? {
+        var pos = vi.startIndex
+        while pos < vi.endIndex {
+            let tag = try readVarint(vi, &pos)
+            let field = tag >> 3
+            let wire = tag & 0x7
+            if field == 2 && wire == 2 {
+                let len = Int(try readVarint(vi, &pos))
+                guard pos + len <= vi.endIndex else { throw NSError(domain: "OnnxQuantizer", code: 31) }
+                let tp = vi[pos..<(pos + len)]
+                var tpPos = tp.startIndex
+                while tpPos < tp.endIndex {
+                    let ttTag = try readVarint(tp, &tpPos)
+                    let ttField = ttTag >> 3
+                    let ttWire = ttTag & 0x7
+                    if ttField == 1 && ttWire == 2 {
+                        let tlen = Int(try readVarint(tp, &tpPos))
+                        let ttype = tp[tpPos..<(tpPos + tlen)]
+                        var tPos = ttype.startIndex
+                        while tPos < ttype.endIndex {
+                            let sTag = try readVarint(ttype, &tPos)
+                            let sField = sTag >> 3
+                            let sWire = sTag & 0x7
+                            if sField == 2 && sWire == 2 {
+                                let slen = Int(try readVarint(ttype, &tPos))
+                                let shape = ttype[tPos..<(tPos + slen)]
+                                var sPos = shape.startIndex
+                                var dims = 0
+                                while sPos < shape.endIndex {
+                                    let dTag = try readVarint(shape, &sPos)
+                                    let dField = dTag >> 3
+                                    let dWire = dTag & 0x7
+                                    if dField == 1 { dims += 1 }
+                                    _ = try skipField(shape, &sPos, wire: dWire)
+                                }
+                                return dims
+                            } else {
+                                _ = try skipField(ttype, &tPos, wire: sWire)
+                            }
+                        }
+                        return nil
+                    } else {
+                        _ = try skipField(tp, &tpPos, wire: ttWire)
+                    }
+                }
+                return nil
+            } else {
+                _ = try skipField(vi, &pos, wire: wire)
+            }
+        }
+        return nil
+    }
+
+    private static func freezeBatchDimInValueInfo(_ vi: Data) throws -> Data {
+        func patchShape(_ sh: Data) throws -> Data {
+            var pos = sh.startIndex
+            var out = Data()
+            var firstDim = true
+            while pos < sh.endIndex {
+                let start = pos
+                let tag = try readVarint(sh, &pos)
+                let field = tag >> 3
+                let wire = tag & 0x7
+                _ = try skipField(sh, &pos, wire: wire)
+                if field == 1 && wire == 2 && firstDim {
+                    firstDim = false
+                    var dim = Data()
+                    appendTag(&dim, field: 1, wire: 0)
+                    appendVarint(&dim, 1)
+                    appendBytesField(&out, field: 1, payload: dim)
+                } else {
+                    out.append(sh[start..<pos])
+                }
+            }
+            return out
+        }
+        func patchTensorType(_ tt: Data) throws -> Data {
+            var pos = tt.startIndex
+            var out = Data()
+            while pos < tt.endIndex {
+                let start = pos
+                let tag = try readVarint(tt, &pos)
+                let field = tag >> 3
+                let wire = tag & 0x7
+                if field == 2 && wire == 2 {
+                    let len = Int(try readVarint(tt, &pos))
+                    let patched = try patchShape(tt[pos..<(pos + len)])
+                    pos += len
+                    appendBytesField(&out, field: 2, payload: patched)
+                } else {
+                    _ = try skipField(tt, &pos, wire: wire)
+                    out.append(tt[start..<pos])
+                }
+            }
+            return out
+        }
+        func patchType(_ tp: Data) throws -> Data {
+            var pos = tp.startIndex
+            var out = Data()
+            while pos < tp.endIndex {
+                let start = pos
+                let tag = try readVarint(tp, &pos)
+                let field = tag >> 3
+                let wire = tag & 0x7
+                if field == 1 && wire == 2 {
+                    let len = Int(try readVarint(tp, &pos))
+                    let patched = try patchTensorType(tp[pos..<(pos + len)])
+                    pos += len
+                    appendBytesField(&out, field: 1, payload: patched)
+                } else {
+                    _ = try skipField(tp, &pos, wire: wire)
+                    out.append(tp[start..<pos])
+                }
+            }
+            return out
+        }
+        var pos = vi.startIndex
+        var out = Data()
+        while pos < vi.endIndex {
+            let start = pos
+            let tag = try readVarint(vi, &pos)
+            let field = tag >> 3
+            let wire = tag & 0x7
+            if field == 2 && wire == 2 {
+                let len = Int(try readVarint(vi, &pos))
+                let patched = try patchType(vi[pos..<(pos + len)])
+                pos += len
+                appendBytesField(&out, field: 2, payload: patched)
+            } else {
+                _ = try skipField(vi, &pos, wire: wire)
+                out.append(vi[start..<pos])
+            }
+        }
+        return out
+    }
+
+    private static func stripEndIfShapeMatchesRank(_ node: Data, tensorRanks: [String: Int]) throws -> (Data, Bool) {
+        var pos = node.startIndex
+        var opType = ""
+        var firstInput = ""
+        var gotFirstIn = false
+        while pos < node.endIndex {
+            let tag = try readVarint(node, &pos)
+            let field = tag >> 3
+            let wire = tag & 0x7
+            if field == 1 && wire == 2 {
+                let len = Int(try readVarint(node, &pos))
+                if !gotFirstIn {
+                    gotFirstIn = true
+                    firstInput = String(data: node[pos..<(pos + len)], encoding: .utf8) ?? ""
+                }
+                pos += len
+            } else if field == 4 && wire == 2 {
+                let len = Int(try readVarint(node, &pos))
+                opType = String(data: node[pos..<(pos + len)], encoding: .utf8) ?? ""
+                pos += len
+            } else {
+                _ = try skipField(node, &pos, wire: wire)
+            }
+        }
+        guard opType == "Shape", let rank = tensorRanks[firstInput] else {
+            return (node, false)
+        }
+        pos = node.startIndex
+        var out = Data()
+        var modified = false
+        while pos < node.endIndex {
+            let start = pos
+            let tag = try readVarint(node, &pos)
+            let field = tag >> 3
+            let wire = tag & 0x7
+            if field == 5 && wire == 2 {
+                let len = Int(try readVarint(node, &pos))
+                let attr = node[pos..<(pos + len)]
+                pos += len
+                var ap = attr.startIndex
+                var attrName = ""
+                var attrInt: Int64?
+                while ap < attr.endIndex {
+                    let aTag = try readVarint(attr, &ap)
+                    let af = aTag >> 3
+                    let aw = aTag & 0x7
+                    if af == 1 && aw == 2 {
+                        let alen = Int(try readVarint(attr, &ap))
+                        attrName = String(data: attr[ap..<(ap + alen)], encoding: .utf8) ?? ""
+                        ap += alen
+                    } else if af == 3 && aw == 0 {
+                        attrInt = Int64(bitPattern: try readVarint(attr, &ap))
+                    } else {
+                        _ = try skipField(attr, &ap, wire: aw)
+                    }
+                }
+                if attrName == "end", let endVal = attrInt, endVal == Int64(rank) {
+                    modified = true
+                    continue
+                }
+                out.append(node[start..<pos])
+            } else {
+                _ = try skipField(node, &pos, wire: wire)
+                out.append(node[start..<pos])
+            }
+        }
+        return (out, modified)
+    }
+
+    static func prepareCoreMLFp16Model(srcPath: String, dstPath: String, freezeInputBatchToOne: Bool, fixShapeEndMatchingRank: Bool) throws {
+        let files = FileManager.default
+        let dstURL = URL(fileURLWithPath: dstPath)
+        try files.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: srcPath), options: .mappedIfSafe)
+        var pos = data.startIndex
+        var outModel = Data()
+        var patchedNodes = 0
+        var frozenInputs = 0
+
+        while pos < data.endIndex {
+            let mStart = pos
+            let tag = try readVarint(data, &pos)
+            let field = tag >> 3
+            let wire = tag & 0x7
+            if field == 7 && wire == 2 {
+                let gLen = Int(try readVarint(data, &pos))
+                let graph = data[pos..<(pos + gLen)]
+                pos += gLen
+
+                var tensorRanks: [String: Int] = [:]
+                if fixShapeEndMatchingRank {
+                    var scanPos = graph.startIndex
+                    while scanPos < graph.endIndex {
+                        let gtag = try readVarint(graph, &scanPos)
+                        let gf = gtag >> 3
+                        let gw = gtag & 0x7
+                        if (gf == 11 || gf == 12 || gf == 13) && gw == 2 {
+                            let vlen = Int(try readVarint(graph, &scanPos))
+                            let vi = graph[scanPos..<(scanPos + vlen)]
+                            scanPos += vlen
+                            if let name = try valueInfoInputName(vi), let rank = try valueInfoRank(vi) {
+                                tensorRanks[name] = rank
+                            }
+                        } else {
+                            _ = try skipField(graph, &scanPos, wire: gw)
+                        }
+                    }
+                }
+
+                var gp = graph.startIndex
+                var outGraph = Data()
+                while gp < graph.endIndex {
+                    let gStart = gp
+                    let gtag = try readVarint(graph, &gp)
+                    let gf = gtag >> 3
+                    let gw = gtag & 0x7
+                    if gf == 1 && gw == 2 && fixShapeEndMatchingRank {
+                        let nlen = Int(try readVarint(graph, &gp))
+                        let (patchedNode, didMod) = try stripEndIfShapeMatchesRank(graph[gp..<(gp + nlen)], tensorRanks: tensorRanks)
+                        gp += nlen
+                        if didMod { patchedNodes += 1 }
+                        appendBytesField(&outGraph, field: 1, payload: patchedNode)
+                    } else if gf == 11 && gw == 2 && freezeInputBatchToOne {
+                        let vlen = Int(try readVarint(graph, &gp))
+                        let patchedVi = try freezeBatchDimInValueInfo(graph[gp..<(gp + vlen)])
+                        gp += vlen
+                        frozenInputs += 1
+                        appendBytesField(&outGraph, field: 11, payload: patchedVi)
+                    } else {
+                        _ = try skipField(graph, &gp, wire: gw)
+                        outGraph.append(graph[gStart..<gp])
+                    }
+                }
+                appendBytesField(&outModel, field: 7, payload: outGraph)
+            } else {
+                _ = try skipField(data, &pos, wire: wire)
+                outModel.append(data[mStart..<pos])
+            }
+        }
+
+        let partURL = URL(fileURLWithPath: dstPath + ".part")
+        try outModel.write(to: partURL)
+        if files.fileExists(atPath: dstPath) {
+            try files.removeItem(at: dstURL)
+        }
+        try files.moveItem(at: partURL, to: dstURL)
+        print("[configure-mac-json.swift] CoreML FP16 prepared: \(dstPath) (shapeEndPatched=\(patchedNodes), frozenInputs=\(frozenInputs), \(outModel.count / (1024 * 1024)) MiB)")
+    }
 }
 
 // MARK: - Configure Models/native.local.json
@@ -892,7 +1196,7 @@ if var stt = cfg.models["stt"] {
     cfg.models["stt"] = stt
 }
 
-// MARK: - TTS Configuration (Option 1: Qwen3-TTS 0.6B INT4 on Mac GPU/CoreML, Option 2 --low-memory: MeloTTS-Korean INT8 on Mac GPU/CoreML)
+// MARK: - TTS Configuration (Option 1: Qwen3-TTS 0.6B FP16 on Mac GPU/CoreML, Option 2 --low-memory: MeloTTS-Korean INT8 on Mac GPU/CoreML)
 if var tts = cfg.models["tts"] {
     tts.backend = "onnxruntime"
     tts.device = "metal"
@@ -923,26 +1227,45 @@ if var tts = cfg.models["tts"] {
         let baseDir = ttsDirs.first(where: { files.fileExists(atPath: "Models/" + $0 + "/config.json") })
             ?? "tts/qwen3-tts-12hz-0.6b-customvoice"
 
-        let int4Subdir = "cpu_int4"
-        for name in ["text_embed.onnx", "codec_embed.onnx", "residual_embed.onnx", "talker_cache.onnx", "talker.onnx", "code_predictor.onnx"] {
+        // CoreML MLProgram cannot execute DequantizeLinear(INT4, block_size=32) on GPU, so Mac GPU
+        // uses FP16 weights with CoreML-safe Shape(end) / static batch=1 patches under coreml_fp16/.
+        let coremlSubdir = "coreml_fp16"
+        for name in ["talker_cache.onnx", "talker.onnx"] {
             let srcPath = "Models/\(baseDir)/\(name)"
-            let dstPath = "Models/\(baseDir)/\(int4Subdir)/\(name)"
+            let dstPath = "Models/\(baseDir)/\(coremlSubdir)/\(name)"
             if files.fileExists(atPath: srcPath), !isUpToDate(dstPath, relativeTo: srcPath) {
-                try OnnxQuantizer.convertModelFile(srcPath: srcPath, dstPath: dstPath, allowInt4: true)
+                try OnnxQuantizer.prepareCoreMLFp16Model(
+                    srcPath: srcPath,
+                    dstPath: dstPath,
+                    freezeInputBatchToOne: false,
+                    fixShapeEndMatchingRank: true
+                )
+            }
+        }
+        do {
+            let srcPath = "Models/\(baseDir)/code_predictor.onnx"
+            let dstPath = "Models/\(baseDir)/\(coremlSubdir)/code_predictor.onnx"
+            if files.fileExists(atPath: srcPath), !isUpToDate(dstPath, relativeTo: srcPath) {
+                try OnnxQuantizer.prepareCoreMLFp16Model(
+                    srcPath: srcPath,
+                    dstPath: dstPath,
+                    freezeInputBatchToOne: true,
+                    fixShapeEndMatchingRank: false
+                )
             }
         }
 
-        let precisionDirs = [baseDir + "/cpu_int4", baseDir + "/cpu_fp16", baseDir]
+        let precisionDirs = [baseDir + "/" + coremlSubdir, baseDir + "/cpu_fp16", baseDir]
         let decoderDirs = [baseDir, baseDir + "/cpu_fp32"]
         func ttsArt(_ candidates: [String], in dirs: [String] = precisionDirs, fallback: String) -> String {
             firstExistingRelative(in: dirs, candidates: candidates) ?? (baseDir + "/" + fallback)
         }
         var paths: [String: String] = [
-            "text_embed": ttsArt(["text_embed.int4.onnx", "text_embed.onnx"], fallback: "text_embed.onnx"),
-            "codec_embed": ttsArt(["codec_embed.int4.onnx", "codec_embed.onnx"], fallback: "codec_embed.onnx"),
-            "residual_embed": ttsArt(["residual_embed.int4.onnx", "residual_embed.onnx"], fallback: "residual_embed.onnx"),
-            "talker": ttsArt(["talker_cache.int4.onnx", "talker.int4.onnx", "talker_cache.onnx", "talker.onnx"], fallback: "talker_cache.onnx"),
-            "code_predictor": ttsArt(["code_predictor.int4.onnx", "code_predictor.onnx"], fallback: "code_predictor.onnx"),
+            "text_embed": ttsArt(["text_embed.onnx"], fallback: "text_embed.onnx"),
+            "codec_embed": ttsArt(["codec_embed.onnx"], fallback: "codec_embed.onnx"),
+            "residual_embed": ttsArt(["residual_embed.onnx"], fallback: "residual_embed.onnx"),
+            "talker": ttsArt(["talker_cache.onnx", "talker.onnx"], fallback: "talker_cache.onnx"),
+            "code_predictor": ttsArt(["code_predictor.onnx"], fallback: "code_predictor.onnx"),
             "tok_decoder": ttsArt(["tok_decoder.onnx"], in: decoderDirs, fallback: "tok_decoder.onnx"),
             "config": baseDir + "/config.json",
         ]
