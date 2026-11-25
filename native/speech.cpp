@@ -26,6 +26,23 @@ std::string trim_whitespace(const std::string &s) {
     while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
     return s.substr(a, b - a);
 }
+std::string join_tokens(const char *const *tokens_arr, int32_t count, const char *fallback) {
+    if (tokens_arr && count > 0) {
+        std::string joined;
+        for (int32_t i = 0; i < count; ++i) {
+            if (!tokens_arr[i]) continue;
+            std::string tok(tokens_arr[i]);
+            for (size_t pos = 0; (pos = tok.find("\xe2\x96\x81", pos)) != std::string::npos;) {
+                tok.replace(pos, 3, " ");
+                pos += 1;
+            }
+            joined += tok;
+        }
+        std::string trimmed = trim_whitespace(joined);
+        if (!trimmed.empty()) return trimmed;
+    }
+    return fallback ? trim_whitespace(fallback) : std::string();
+}
 
 class WhisperModel final : public Model {
     whisper_context *context=nullptr;
@@ -131,6 +148,7 @@ public:
 class ZipformerModel final : public Model {
     const SherpaOnnxOfflineRecognizer *offline_rec=nullptr;
     const SherpaOnnxOnlineRecognizer *online_rec=nullptr;
+    std::unordered_map<std::string, const SherpaOnnxOnlineStream *> streams;
     bool streaming=false;
 public:
     explicit ZipformerModel(const json &c):Model(c) {
@@ -177,10 +195,65 @@ public:
     }
     ~ZipformerModel() {
         stop();
+        for (auto &kv : streams) {
+            if (kv.second) SherpaOnnxDestroyOnlineStream(kv.second);
+        }
+        streams.clear();
         if(online_rec) SherpaOnnxDestroyOnlineRecognizer(online_rec);
         if(offline_rec) SherpaOnnxDestroyOfflineRecognizer(offline_rec);
     }
     json infer(Job &job) override {
+        require(!job.cancelled.load(),"CANCELLED");
+        if(streaming && job.input.contains("sessionId") && job.input["sessionId"].is_string()) {
+            std::string sid=job.input.at("sessionId").get<std::string>();
+            std::string action=job.input.value("action",std::string("end"));
+            if(action=="cancel") {
+                auto it=streams.find(sid);
+                if(it!=streams.end()) {
+                    if(it->second) SherpaOnnxDestroyOnlineStream(it->second);
+                    streams.erase(it);
+                }
+                return {{"text",""},{"confidence",0.0}};
+            }
+            const SherpaOnnxOnlineStream *stream=nullptr;
+            auto it=streams.find(sid);
+            if(it!=streams.end()) {
+                stream=it->second;
+            } else {
+                stream=SherpaOnnxCreateOnlineStream(online_rec);
+                require(stream,"STT_STREAM_FAILED");
+                streams[sid]=stream;
+            }
+            std::string b64=job.input.value("pcm",std::string());
+            if(!b64.empty()) {
+                auto pcm=decode_pcm(b64);
+                require(pcm.size()<=480000,"STT_AUDIO_LIMIT");
+                if(!pcm.empty()) {
+                    SherpaOnnxOnlineStreamAcceptWaveform(stream,16000,pcm.data(),static_cast<int32_t>(pcm.size()));
+                }
+            }
+            if(action=="end") {
+                std::vector<float> tail(12800,0.0f); // 0.8s tail flush so the final chunk-64 flushes completely
+                SherpaOnnxOnlineStreamAcceptWaveform(stream,16000,tail.data(),static_cast<int32_t>(tail.size()));
+                SherpaOnnxOnlineStreamInputFinished(stream);
+            }
+            while(SherpaOnnxIsOnlineStreamReady(online_rec,stream)) {
+                require(!job.cancelled.load(),"CANCELLED");
+                SherpaOnnxDecodeOnlineStream(online_rec,stream);
+            }
+            const SherpaOnnxOnlineRecognizerResult *r=SherpaOnnxGetOnlineStreamResult(online_rec,stream);
+            std::string text;
+            if(r) {
+                text=join_tokens(r->tokens_arr,r->count,r->text);
+                SherpaOnnxDestroyOnlineRecognizerResult(r);
+            }
+            if(action=="end") {
+                SherpaOnnxDestroyOnlineStream(stream);
+                streams.erase(sid);
+            }
+            double confidence=text.empty()?0.0:1.0;
+            return {{"text",text},{"confidence",confidence}};
+        }
         auto pcm=decode_pcm(job.input.at("pcm"));
         require(!pcm.empty()&&pcm.size()<=480000,"STT_AUDIO_LIMIT");
         require(!job.cancelled.load(),"CANCELLED");
@@ -206,7 +279,7 @@ public:
             }
             guard.r=SherpaOnnxGetOnlineStreamResult(online_rec,guard.s);
             require(guard.r,"STT_INFERENCE_FAILED");
-            std::string text=guard.r->text?trim_whitespace(guard.r->text):std::string();
+            std::string text=join_tokens(guard.r->tokens_arr,guard.r->count,guard.r->text);
             double confidence=text.empty()?0.0:1.0;
             return {{"text",text},{"confidence",confidence}};
         } else {
@@ -226,7 +299,7 @@ public:
             require(!job.cancelled.load(),"CANCELLED");
             guard.r=SherpaOnnxGetOfflineStreamResult(guard.s);
             require(guard.r,"STT_INFERENCE_FAILED");
-            std::string text=guard.r->text?trim_whitespace(guard.r->text):std::string();
+            std::string text=join_tokens(guard.r->tokens_arr,guard.r->count,guard.r->text);
             double confidence=text.empty()?0.0:1.0;
             if(guard.r->ys_log_probs&&guard.r->count>0) {
                 double log_sum=0.0;
@@ -247,7 +320,7 @@ public:
         require(dev=="cpu"||dev=="cuda"||dev=="metal"||dev=="coreml","VAD_DEVICE_UNSUPPORTED");
         std::string provider=(dev=="cuda")?"cuda":(dev=="metal"||dev=="coreml")?"coreml":"cpu";
         auto file=path("model");SherpaOnnxVadModelConfig cfg{};cfg.silero_vad.model=file.c_str();
-        cfg.silero_vad.threshold=0.5f;cfg.silero_vad.min_silence_duration=0.5f;cfg.silero_vad.min_speech_duration=0.1f;
+        cfg.silero_vad.threshold=c.value("threshold",0.5f);cfg.silero_vad.min_silence_duration=c.value("minSilenceDuration",0.3f);cfg.silero_vad.min_speech_duration=c.value("minSpeechDuration",0.08f);
         cfg.silero_vad.window_size=512;cfg.silero_vad.max_speech_duration=29;cfg.sample_rate=16000;
         cfg.num_threads=1;cfg.provider=provider.c_str();vad=SherpaOnnxCreateVoiceActivityDetector(&cfg,30);
         require(vad,"VAD_LOAD_FAILED");

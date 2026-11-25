@@ -81,6 +81,7 @@ public struct Adapters: Sendable {
     public var remoteRouter: (any RemoteRouter)?
     public var gpuExecutor: GPUExecutor?
     public var emotion: (any EmotionClassifier)?
+    public var soundCue: (any SoundCuePlayer)?
     public var inputEpochValidator: (any AudioInputEpochValidator)?
     public var taskRefs: [HarnessTaskRef] = []
     public init(stt: any SpeechRecognizer, router: (any RouterModel)? = nil, eureka: any EurekaAdapter,

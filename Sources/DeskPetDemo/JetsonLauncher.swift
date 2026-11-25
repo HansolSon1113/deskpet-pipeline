@@ -313,8 +313,9 @@ enum JetsonLauncher {
         let directLLM = (config.directLLM ?? false) || arguments.contains("--direct-llm")
         let shortOutput = (config.shortOutput ?? false) || arguments.contains("--short-output")
         let keyboard = arguments.contains("--keyboard")
+        let noTTS = arguments.contains("--no-tts")
         let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
-            .filter { !directLLM || $0 != "router" }
+            .filter { (!directLLM || $0 != "router") && (!noTTS || $0 != "tts") }
         let performance = try NativeDemo.performanceRecorder(config: config, arguments: arguments, configURL: configURL,
                                                             roles: roles, directLLM: directLLM)
         defer { performance.close() }
@@ -360,11 +361,16 @@ enum JetsonLauncher {
         let emotionExecutor = loaded["emotion"]?.configuration.device != "cpu" ? gpu : nil
         let recognizer: any SpeechRecognizer = keyboard ? KeyboardOnlyRecognizer()
             : NativeStreamingSTT(model: loaded["stt"]!, executor: sttExecutor)
+        let contextProvider = OutputContextProvider(
+            latitude: env["DESKPET_WEATHER_LAT"].flatMap(Double.init) ?? 37.5665,
+            longitude: env["DESKPET_WEATHER_LON"].flatMap(Double.init) ?? 126.9780
+        )
+        await contextProvider.startWeatherRefresh()
         var adapters = Adapters(stt: recognizer,
             router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
-            output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
-            tts: NativeSpeechSynthesizer(model: loaded["tts"]!, executor: ttsExecutor),
+            output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput, contextProvider: contextProvider),
+            tts: noTTS ? MockTTS() : NativeSpeechSynthesizer(model: loaded["tts"]!, executor: ttsExecutor),
             speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!, executor: emotionExecutor)
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
@@ -405,6 +411,8 @@ enum JetsonLauncher {
         var timing = PipelineConfiguration()
         timing.routingMode = directLLM ? .directLLM : .model
         timing.confirmedTextInput = keyboard || arguments.contains("--text")
+        timing.asyncHarnessAck = true
+        timing.ruleBypassEnabled = true
         timing.routeConfidenceThreshold = config.routeConfidenceThreshold ?? 0.3
         timing.sttConfidenceThreshold = config.sttConfidenceThreshold ?? 0.3
         let pipeline = try DeskPetPipeline(adapters: adapters, configuration: timing)
@@ -462,9 +470,11 @@ enum JetsonLauncher {
             }
         } catch {
             if let hardwareMic { try? await hardwareMic.stop() }
+            await contextProvider.stop()
             await pipeline.shutdown(); await harness.close(); await logger.value; await NativeDemo.measurements(pipeline); throw error
         }
         if let hardwareMic { try? await hardwareMic.stop() }
+        await contextProvider.stop()
         await pipeline.shutdown(); await harness.close(); await logger.value; await NativeDemo.measurements(pipeline)
     }
 

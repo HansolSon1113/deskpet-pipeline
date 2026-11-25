@@ -128,6 +128,7 @@ public struct HeadOutputs: Sendable, Codable {
     public var modelIntention: Head<ModelIntention>?
     public var operation: Head<String?>?
     public var checkpoint: Head<String?>?
+    public var filter: Head<String?>?
     public var spans: [String: ModelSpan]?
     public var modelConfidence: Double?
     public var generationFinished: [String: Bool]?
@@ -192,8 +193,9 @@ public struct ActionRequest: Sendable, Codable {
     public var requestId: UUID
     public var decision: RouteDecision
     public var deadlineAt: Date
-    public init(operationId: UUID = UUID(), requestId: UUID, decision: RouteDecision, deadlineAt: Date) {
-        self.operationId = operationId; self.requestId = requestId; self.decision = decision; self.deadlineAt = deadlineAt
+    public var mutationApproved: Bool = false
+    public init(operationId: UUID = UUID(), requestId: UUID, decision: RouteDecision, deadlineAt: Date, mutationApproved: Bool = false) {
+        self.operationId = operationId; self.requestId = requestId; self.decision = decision; self.deadlineAt = deadlineAt; self.mutationApproved = mutationApproved
     }
 }
 public struct ActionResult: Sendable, Codable {

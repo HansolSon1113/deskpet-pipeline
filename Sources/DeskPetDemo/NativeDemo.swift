@@ -50,8 +50,9 @@ struct NativeDemo {
         let directLLM = (config.directLLM ?? false) || arguments.contains("--direct-llm")
         let shortOutput = (config.shortOutput ?? false) || arguments.contains("--short-output")
         let keyboard = arguments.contains("--keyboard")
+        let noTTS = arguments.contains("--no-tts")
         let roles = (keyboard ? ["router", "output", "emotion", "tts"] : ["router", "output", "stt", "vad", "emotion", "tts"])
-            .filter { !directLLM || $0 != "router" }
+            .filter { (!directLLM || $0 != "router") && (!noTTS || $0 != "tts") }
         let performance = try performanceRecorder(config: config, arguments: arguments, configURL: configURL,
                                                 roles: roles, directLLM: directLLM)
         defer { performance.close() }
@@ -142,13 +143,23 @@ struct NativeDemo {
         let recognizer: any SpeechRecognizer
         if keyboard { recognizer = KeyboardOnlyRecognizer() }
         else { recognizer = NativeStreamingSTT(model: loaded["stt"]!, executor: loaded["stt"]?.configuration.device == "cpu" ? nil : gpu) }
+        let contextProvider = OutputContextProvider(
+            latitude: env["DESKPET_WEATHER_LAT"].flatMap(Double.init) ?? 37.5665,
+            longitude: env["DESKPET_WEATHER_LON"].flatMap(Double.init) ?? 126.9780
+        )
+        await contextProvider.startWeatherRefresh()
         var adapters = Adapters(stt: recognizer,
             router: loaded["router"].map { NativeRouterModel(model: $0, executor: gpu, configuredTarget: target, contextEnabled: routerContextEnabled) },
             eureka: ServerEureka(connection: harness), harness: harness,
-            output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput),
-            tts: NativeSpeechSynthesizer(model: loaded["tts"]!, executor: loaded["tts"]?.configuration.device == "cpu" ? nil : gpu),
+            output: NativeOutputModel(model: loaded["output"]!, executor: gpu, shortOutput: shortOutput, contextProvider: contextProvider),
+            tts: noTTS ? MockTTS() : NativeSpeechSynthesizer(model: loaded["tts"]!, executor: loaded["tts"]?.configuration.device == "cpu" ? nil : gpu),
             speaker: MockSpeaker(), display: MockDisplay(), gpuExecutor: gpu)
         adapters.emotion = NativeEmotionClassifier(model: loaded["emotion"]!, executor: loaded["emotion"]?.configuration.device == "cpu" ? nil : gpu)
+        #if os(macOS)
+        if arguments.contains("--live") && !keyboard {
+            adapters.soundCue = MacSoundCuePlayer()
+        }
+        #endif
         if let item = env["DEMO_EUREKA_ITEM_ID"], let stage = env["DEMO_EUREKA_STAGE_ID"], !item.isEmpty, !stage.isEmpty {
             adapters.taskRefs = [HarnessTaskRef(itemId: item, stageId: stage, repository: repository, prNumber: number)]
         }
@@ -163,15 +174,19 @@ struct NativeDemo {
         let mic = MacMicrophoneSource()
         if arguments.contains("--live") || keyboard {
             let display = hardwareDisplay
-            adapters.speaker = MacSpeakerAdapter(microphone: mic, onStarted: { id in
-                if let display { try? await display.audioStarted(outputId: id.uuidString) }
-            })
+            if !noTTS {
+                adapters.speaker = MacSpeakerAdapter(microphone: mic, onStarted: { id in
+                    if let display { try? await display.audioStarted(outputId: id.uuidString) }
+                })
+            }
             if !keyboard { adapters.inputEpochValidator = mic }
         }
         #endif
         var timing = PipelineConfiguration()
         timing.routingMode = directLLM ? .directLLM : .model
         timing.confirmedTextInput = keyboard || arguments.contains("--text")
+        timing.asyncHarnessAck = true
+        timing.ruleBypassEnabled = true
         timing.routeConfidenceThreshold = config.routeConfidenceThreshold ?? 0.3
         timing.sttConfidenceThreshold = config.sttConfidenceThreshold ?? 0.3
         let pipeline = try DeskPetPipeline(adapters: adapters, configuration: timing)
@@ -226,11 +241,13 @@ struct NativeDemo {
             #if os(macOS)
             mic.stop()
             #endif
+            await contextProvider.stop()
             await pipeline.shutdown(); await harness.close(); await logger.value; throw error
         }
         #if os(macOS)
         mic.stop()
         #endif
+        await contextProvider.stop()
         await pipeline.shutdown(); await harness.close(); await logger.value
     }
     static func performanceRecorder(config: Configuration, arguments: [String], configURL: URL,

@@ -153,18 +153,20 @@ private final class NativeInferenceJob: @unchecked Sendable {
 public struct NativeOutputModel: OutputModel {
     public static let shortOutputPrompt = """
     당신은 데스크펫 음성 비서입니다. 응답은 곧바로 TTS 음성으로 읽히므로 다음 규칙을 반드시 지키세요.
-    1. 별표(*, **), 밑줄(_), 샵(#), 하이픈(-), 백틱(`) 등 강조 기호나 마크다운 서식을 절대 사용하지 마세요.
+    1. 이모지, 이모티콘, 별표(*, **), 밑줄(_), 샵(#), 하이픈(-), 백틱(`) 등 기호나 마크다운 서식을 절대 사용하지 마세요.
     2. 소괄호(())나 대괄호([])를 사용한 부가 서술, 부연 설명, 병기를 절대 쓰지 마세요. 꼭 필요한 내용은 괄호 없이 문장으로 자연스럽게 풀어 쓰거나 생략하세요.
     3. 번호 매기기나 글머리 기호 목록 대신 소리 내어 읽기 자연스러운 한국어 평문 문장으로 이어서 답하세요.
-    4. 설명, 방법, 레시피 등 글 작성이 필요한 요청에는 핵심 항목(예: 필요한 재료나 준비물)만 간단히 언급하고 과정이나 핵심 내용을 5~6문장 정도로 짧게 요약해서 끝맺으세요.
+    4. 추천은 기호를 묻거나 여러 개를 나열하지 말고 임의로 하나만 골라 답하고, 설명·방법·레시피는 핵심 항목(예: 필요한 재료나 준비물)과 요약만 간단히 답하세요.
     """
     public let model: NativeInferenceModel
     public let executor: GPUExecutor
     public let shortOutput: Bool
-    public init(model: NativeInferenceModel, executor: GPUExecutor, shortOutput: Bool = false) {
+    public let contextProvider: OutputContextProvider?
+    public init(model: NativeInferenceModel, executor: GPUExecutor, shortOutput: Bool = false, contextProvider: OutputContextProvider? = nil) {
         self.model = model
         self.executor = executor
         self.shortOutput = shortOutput
+        self.contextProvider = contextProvider
     }
     public static func preparedMessages(for messages: [ChatMessage], shortOutput: Bool) -> [ChatMessage] {
         guard shortOutput, !messages.isEmpty else { return messages }
@@ -190,7 +192,15 @@ public struct NativeOutputModel: OutputModel {
         guard request.action == nil, request.reminder == nil, !request.isQuestion, !request.messages.isEmpty else { return request.requiredText }
         struct Reply: Decodable, Sendable { var text: String }
         struct Input: Encodable, Sendable { var messages: [ChatMessage] }
-        let messages = Self.preparedMessages(for: request.messages, shortOutput: shortOutput)
+        var messages = Self.preparedMessages(for: request.messages, shortOutput: shortOutput)
+        if let contextProvider {
+            let ctx = await contextProvider.currentContextLine()
+            if messages.first?.role == "system" {
+                messages[0].content += "\n\(ctx)"
+            } else {
+                messages = [ChatMessage(role: "system", content: ctx)] + messages
+            }
+        }
         let result = try await model.gpu(Input(messages: messages), executor: executor, as: Reply.self)
         return shortOutput ? Self.sanitizeForSpeech(result.text) : result.text
     }
@@ -303,33 +313,171 @@ public enum NativeRouterContract {
         }
     }
     public static func date(_ text: String, relativeTo reference: Date) -> Date? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let value = iso.date(from: text) ?? ISO8601DateFormatter().date(from: text) { return value }
+        if let value = iso.date(from: trimmed) ?? ISO8601DateFormatter().date(from: trimmed) { return value }
+
+        let seoul = TimeZone(identifier: "Asia/Seoul") ?? .current
         let format = DateFormatter(); format.locale = Locale(identifier: "ko_KR"); format.isLenient = false
-        format.timeZone = TimeZone(identifier: "Asia/Seoul"); format.dateFormat = "yyyy-MM-dd"
-        if text.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil, let value = format.date(from: text) { return value }
+        format.timeZone = seoul; format.dateFormat = "yyyy-MM-dd"
+        if trimmed.range(of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", options: .regularExpression) != nil,
+           let value = format.date(from: trimmed) { return value }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = seoul
+
+        func firstGroups(_ pattern: String) -> [String]? {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+            let ns = trimmed as NSString
+            guard let match = regex.firstMatch(in: trimmed, range: NSRange(location: 0, length: ns.length)) else {
+                return nil
+            }
+            return (0..<match.numberOfRanges).map { idx in
+                let range = match.range(at: idx)
+                return range.location == NSNotFound ? "" : ns.substring(with: range)
+            }
+        }
+
+        func parseClockTime() -> (hour: Int, minute: Int)? {
+            if let g = firstGroups("(오전|오후|저녁|밤|새벽|낮)?\\s*([0-9]{1,2})\\s*시(?!간)(?:\\s*([0-9]{1,2})\\s*분|\\s*(반))?"),
+               var hour = Int(g[2]) {
+                let meridiem = g[1]
+                let minute = !g[3].isEmpty ? (Int(g[3]) ?? -1) : (!g[4].isEmpty ? 30 : 0)
+                if (meridiem == "오후" || meridiem == "저녁" || meridiem == "밤"), (1...11).contains(hour) {
+                    hour += 12
+                } else if (meridiem == "오전" || meridiem == "새벽"), hour == 12 {
+                    hour = 0
+                }
+                guard (0...23).contains(hour), (0...59).contains(minute) else { return nil }
+                return (hour, minute)
+            }
+            if trimmed.contains("정오") { return (12, 0) }
+            if trimmed.contains("자정") { return (23, 59) }
+            return nil
+        }
+
+        func applyTime(_ date: Date, _ time: (hour: Int, minute: Int)?) -> Date? {
+            let h = time?.hour ?? 23
+            let m = time?.minute ?? 59
+            return calendar.date(bySettingHour: h, minute: m, second: 0, of: date)
+        }
+
+        if let g = firstGroups("([0-9]+)\\s*시간\\s*(뒤|후)"), let n = Int(g[1]), n > 0 {
+            return reference.addingTimeInterval(Double(n) * 3600)
+        }
+        if let g = firstGroups("([0-9]+)\\s*분\\s*(뒤|후)"), let n = Int(g[1]), n > 0 {
+            return reference.addingTimeInterval(Double(n) * 60)
+        }
+
+        let time = parseClockTime()
+
+        if let g = firstGroups("([0-9]{4})-([0-9]{2})-([0-9]{2})"),
+           let y = Int(g[1]), let m = Int(g[2]), let d = Int(g[3]) {
+            var comps = calendar.dateComponents([.year, .month, .day], from: reference)
+            comps.year = y; comps.month = m; comps.day = d
+            comps.hour = time?.hour ?? 23; comps.minute = time?.minute ?? 59; comps.second = 0
+            return calendar.date(from: comps)
+        }
+
+        if let g = firstGroups("(?:([0-9]{4})\\s*년\\s*)?([0-9]{1,2})\\s*월\\s*([0-9]{1,2})\\s*일"),
+           let m = Int(g[2]), let d = Int(g[3]), (1...12).contains(m), (1...31).contains(d) {
+            let refComps = calendar.dateComponents([.year, .month, .day], from: reference)
+            var year = !g[1].isEmpty ? (Int(g[1]) ?? refComps.year ?? 2026) : (refComps.year ?? 2026)
+            if g[1].isEmpty, let rm = refComps.month, let rd = refComps.day, (m < rm || (m == rm && d < rd)) {
+                year += 1
+            }
+            var comps = DateComponents(year: year, month: m, day: d, hour: time?.hour ?? 23, minute: time?.minute ?? 59, second: 0)
+            comps.timeZone = seoul
+            return calendar.date(from: comps)
+        }
+
+        if let g = firstGroups("([0-9]+)\\s*일\\s*(뒤|후)"), let n = Int(g[1]), n >= 0,
+           let base = calendar.date(byAdding: .day, value: n, to: reference) {
+            return applyTime(base, time)
+        }
+        if let g = firstGroups("([0-9]+)\\s*주\\s*(뒤|후)"), let n = Int(g[1]), n >= 0,
+           let base = calendar.date(byAdding: .day, value: n * 7, to: reference) {
+            return applyTime(base, time)
+        }
+        if let g = firstGroups("([0-9]+)\\s*(개월|달)\\s*(뒤|후)"), let n = Int(g[1]), n >= 0,
+           let base = calendar.date(byAdding: .month, value: n, to: reference) {
+            return applyTime(base, time)
+        }
+
+        let relativeDays: [(String, Int)] = [
+            ("글피", 3), ("모레", 2),
+            ("내일", 1), ("명일", 1),
+            ("오늘", 0), ("금일", 0), ("당일", 0),
+            ("어제", -1)
+        ]
+        for (keyword, offset) in relativeDays where trimmed.contains(keyword) {
+            if let base = calendar.date(byAdding: .day, value: offset, to: reference) {
+                return applyTime(base, time)
+            }
+        }
+
+        let weekdays: [String: Int] = ["월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6]
+        let refMon = (calendar.component(.weekday, from: reference) + 5) % 7
+        if let g = firstGroups("(?:(다다음[ ]?주|다음[ ]?주|차주|이번[ ]?주|금주)\\s*)?(월|화|수|목|금|토|일)요일"),
+           let tgt = weekdays[g[2]] {
+            let prefix = g[1].replacingOccurrences(of: " ", with: "")
+            let delta: Int
+            switch prefix {
+            case "다다음주": delta = (tgt - refMon) + 14
+            case "다음주", "차주": delta = (tgt - refMon) + 7
+            case "이번주", "금주": delta = tgt - refMon
+            default: delta = (tgt - refMon + 7) % 7
+            }
+            if let base = calendar.date(byAdding: .day, value: delta, to: reference) {
+                return applyTime(base, time)
+            }
+        }
+
+        if firstGroups("다음[ ]?주말") != nil,
+           let base = calendar.date(byAdding: .day, value: (5 - refMon) + 7, to: reference) {
+            return applyTime(base, time)
+        }
+        if firstGroups("(?:이번[ ]?)?주말") != nil,
+           let base = calendar.date(byAdding: .day, value: (5 - refMon + 7) % 7, to: reference) {
+            return applyTime(base, time)
+        }
+        if firstGroups("(?:이번[ ]?달[ ]?말|월말)") != nil,
+           let range = calendar.range(of: .day, in: .month, for: reference) {
+            var comps = calendar.dateComponents([.year, .month], from: reference)
+            comps.day = range.upperBound - 1
+            comps.hour = time?.hour ?? 23; comps.minute = time?.minute ?? 59; comps.second = 0
+            return calendar.date(from: comps)
+        }
+        if firstGroups("(다음[ ]?주|차주)") != nil,
+           let base = calendar.date(byAdding: .day, value: 7, to: reference) {
+            return applyTime(base, time)
+        }
+
+        if let time {
+            return applyTime(reference, time)
+        }
+
         // Ambiguous free-form dates remain raw spans and require clarification.
-        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = format.timeZone
-        let days = ["오늘": 0, "내일": 1, "모레": 2]
-        guard let offset = days[text], let date = calendar.date(byAdding: .day, value: offset, to: reference) else { return nil }
-        return calendar.date(bySettingHour: 23, minute: 59, second: 0, of: date)
+        return nil
     }
 }
 
 public actor NativeStreamingSTT: StreamingSpeechRecognizer {
     private let model: NativeInferenceModel
     private let executor: GPUExecutor?
-    private struct Session { var pcm = Data(); var first: Date; var lastPartialBytes = 0 }
+    private struct Session { var pendingPcm = Data(); var totalBytes = 0; var lastPartialBytes = 0; var first: Date }
     private var sessions: [UUID: Session] = [:]
     public init(model: NativeInferenceModel, executor: GPUExecutor? = nil) {
         self.model = model
         self.executor = executor
     }
-    private func recognize(_ pcm: Data, start: Date, end: Date, final: Bool) async throws -> Transcript {
-        struct Input: Encodable, Sendable { var pcm: String; var language = "ko" }
+    private func recognize(_ pcm: Data, sessionId: UUID?, action: String?, start: Date, end: Date, final: Bool) async throws -> Transcript {
+        struct Input: Encodable, Sendable { var pcm: String; var language = "ko"; var sessionId: String?; var action: String? }
         struct Reply: Codable, Sendable { var text: String; var confidence: Double }
-        let input = Input(pcm: pcm.base64EncodedString())
+        let input = Input(pcm: pcm.base64EncodedString(), sessionId: sessionId?.uuidString, action: action)
         let measurement = final ? "final" : "partial"
         let result: Reply
         if let executor {
@@ -342,7 +490,7 @@ public actor NativeStreamingSTT: StreamingSpeechRecognizer {
                           audioStartedAt: start, audioEndedAt: end)
     }
     public func transcribe(_ segment: AudioSegment) async throws -> Transcript {
-        try await recognize(segment.pcm, start: segment.startedAt, end: segment.endedAt, final: true)
+        try await recognize(segment.pcm, sessionId: nil, action: nil, start: segment.startedAt, end: segment.endedAt, final: true)
     }
     public func accept(_ frame: STTFrame) async throws -> Transcript? {
         guard frame.frame.chunk.sampleRate == 16_000, frame.frame.chunk.channels == 1 else {
@@ -351,21 +499,47 @@ public actor NativeStreamingSTT: StreamingSpeechRecognizer {
         if frame.activity == .silence { return nil }
         guard sessions[frame.sessionId] != nil || sessions.count < 2 else { throw PipelineError("STT_BUSY", stage: "stt") }
         var s = sessions[frame.sessionId] ?? Session(first: frame.frame.timestamp)
-        guard s.pcm.count + frame.frame.chunk.data.count <= 960_000 else {
-            sessions.removeValue(forKey: frame.sessionId); throw PipelineError("AUDIO_SEGMENT_OVERFLOW", stage: "stt")
+        guard s.totalBytes + frame.frame.chunk.data.count <= 960_000 else {
+            await cancel(sessionId: frame.sessionId); throw PipelineError("AUDIO_SEGMENT_OVERFLOW", stage: "stt")
         }
-        s.pcm.append(frame.frame.chunk.data)
+        s.pendingPcm.append(frame.frame.chunk.data)
+        s.totalBytes += frame.frame.chunk.data.count
         let final = frame.activity == .end
-        let recognizeNow = final || s.pcm.count - s.lastPartialBytes >= 32_000
-        s.lastPartialBytes = recognizeNow ? s.pcm.count : s.lastPartialBytes
+        let streaming = model.configuration.streaming ?? false
+        let recognizeNow: Bool
+        if streaming {
+            recognizeNow = final || s.pendingPcm.count >= 6_400
+        } else {
+            recognizeNow = final || (s.pendingPcm.count - s.lastPartialBytes >= 32_000)
+            if recognizeNow { s.lastPartialBytes = s.pendingPcm.count }
+        }
+        guard recognizeNow else {
+            sessions[frame.sessionId] = s
+            return nil
+        }
+        let chunk = s.pendingPcm
+        if streaming { s.pendingPcm.removeAll(keepingCapacity: !final) }
         sessions[frame.sessionId] = s
-        guard recognizeNow else { return nil }
-        let result = try await recognize(s.pcm, start: s.first, end: frame.frame.timestamp, final: final)
+        let result = try await recognize(
+            chunk,
+            sessionId: streaming ? frame.sessionId : nil,
+            action: streaming ? (final ? "end" : "chunk") : nil,
+            start: s.first,
+            end: frame.frame.timestamp,
+            final: final
+        )
         guard sessions[frame.sessionId] != nil else { throw CancellationError() }
         if final { sessions.removeValue(forKey: frame.sessionId) }
         return result.text.isEmpty ? nil : result
     }
-    public func cancel(sessionId: UUID) { sessions.removeValue(forKey: sessionId) }
+    public func cancel(sessionId: UUID) async {
+        guard sessions.removeValue(forKey: sessionId) != nil else { return }
+        if model.configuration.streaming ?? false {
+            struct CancelInput: Encodable, Sendable { var sessionId: String; var action = "cancel" }
+            struct Reply: Decodable, Sendable { var text: String }
+            _ = try? await model.run(CancelInput(sessionId: sessionId.uuidString), as: Reply.self, measurement: "cancel")
+        }
+    }
 }
 
 public struct NativeVAD: ResettableVoiceActivityDetector {

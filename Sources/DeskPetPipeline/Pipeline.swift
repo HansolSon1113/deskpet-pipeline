@@ -27,11 +27,12 @@ private struct Job: Sendable {
     var terminal = true
     var operationId = UUID()
     var targetResolution: TargetResolution?
+    var eurekaMutationApproved = false
     var executionToken: UUID { terminal ? token : (output?.outputId ?? token) }
 }
 
 private struct AudioJob: Sendable { var job: Job; var segment: AudioSegment? = nil; var frame: STTFrame? = nil }
-private enum DisplayCommand: Sendable { case output(Job), idle }
+private enum DisplayCommand: Sendable { case output(Job), activity(UUID, Activity), idle }
 private struct PlaybackJob: Sendable { var job: Job; var pcm: PCMChannel }
 private struct DeliveryState: Sendable {
     var job: Job
@@ -88,6 +89,12 @@ public actor DeskPetPipeline {
     private var waitingQuestion: (conversation: String, request: UUID, output: UUID, pendingId: String?)?
     private var droppedEvents = 0
     private var speechSessions: [UUID: Job] = [:]
+    private enum RuleEffect: Sendable { case localReply(String), eurekaConfirm(ActionRequest) }
+    private var pendingRuleEffects: [UUID: RuleEffect] = [:]
+    private var pendingEurekaConfirmations: [String: (request: ActionRequest, expiresAt: Date)] = [:]
+    private var activeTimers: [UUID: (label: String, fireAt: Date, task: Task<Void, Never>)] = [:]
+    private var backgroundHarnessTokens: [UUID: (conversation: String, token: UUID)] = [:]
+    private var explicitlyCancelledRequests: Set<UUID> = []
 
     public init(adapters: Adapters, configuration: PipelineConfiguration = .init()) throws {
         guard configuration.routingMode == .directLLM || adapters.router != nil else {
@@ -195,6 +202,9 @@ public actor DeskPetPipeline {
         guard !stopped else { return }; stopped = true; running = false
         questionTimer?.cancel(); displayTimer?.cancel(); noticeLoop?.cancel(); noticeLoop = nil
         for timer in progressTimers.values { timer.cancel() }; progressTimers.removeAll()
+        for timer in activeTimers.values { timer.task.cancel() }; activeTimers.removeAll()
+        pendingRuleEffects.removeAll(); pendingEurekaConfirmations.removeAll()
+        backgroundHarnessTokens.removeAll(); explicitlyCancelledRequests.removeAll()
         for operations in cancellation.values { for cancel in operations.values { cancel() } }
         for channel in pcmChannels.values { await channel.finish(error: CancellationError()) }
         reminderLoop?.cancel()
@@ -234,6 +244,11 @@ public actor DeskPetPipeline {
         guard original.payload.isFinal else { emit(.partial(original)); return original.requestId }
         guard !original.payload.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PipelineError("NO_SPEECH", stage: "admission")
+        }
+        if config.ruleBypassEnabled, RuleBypass.match(original.payload.text) == .stopSpeaking {
+            await cancel(conversationId: original.conversationId)
+            if active.isEmpty { await displayIdle() }
+            return original.requestId
         }
         var envelope = original
         let pending = await context.pendingRequest(envelope.conversationId)
@@ -289,6 +304,9 @@ public actor DeskPetPipeline {
         clearQuestion(); displayTimer?.cancel()
         if let operations = cancellation[idleDisplayToken] { for cancel in operations.values { cancel() } }
         emit(.transcriptFinal(envelope)); emit(.accepted(envelope.requestId)); emit(.activity(envelope.conversationId, .processing))
+        if replacingAudio != nil {
+            try? await displayQueue.offer(.activity(envelope.requestId, .processing))
+        }
         return envelope.requestId
     }
     // Admission returns immediately after the bounded STT queue accepts the segment.
@@ -336,7 +354,7 @@ public actor DeskPetPipeline {
         do { try await sttQueue.offer(AudioJob(job: job, frame: STTFrame(sessionId: sessionId, frame: frame, activity: activity))) }
         catch { await cancelSpeech(sessionId: sessionId); throw error }
     }
-    public func cancelSpeech(sessionId: UUID) async { await cancelToken(sessionId) }
+    public func cancelSpeech(sessionId: UUID) async { await cancelToken(sessionId); if active.isEmpty { await displayIdle() } }
     private func recognize(_ audio: AudioJob, model: any SpeechRecognizer) async throws -> Transcript? {
         let job = audio.job
         guard current(job) else { throw CancellationError() }
@@ -352,6 +370,9 @@ public actor DeskPetPipeline {
     }
     private func recognized(_ audio: AudioJob, result: Result<Transcript?, any Error>) async {
         let job = audio.job
+        if audio.frame?.activity == .end, let cue = adapters.soundCue {
+            Task { await cue.play(.listenEnd) }
+        }
         do {
             guard let transcript = try result.get() else {
                 if audio.frame?.activity == .end { await cancelSpeech(sessionId: job.token) }
@@ -375,13 +396,14 @@ public actor DeskPetPipeline {
     private func externalContextSnapshot(for job: Job, hasNoticeJob: Bool) async -> ExternalInjectionContext {
         let conversation = job.envelope.conversationId
         let turns = await context.turns(conversation)
-        let isCurrentTurn = lastTurns[conversation] == job.envelope.turnId
-            && latest[conversation].map { $0 == job.token } ?? true
+        let isAsyncActive = config.asyncHarnessAck && !explicitlyCancelledRequests.contains(job.envelope.requestId)
+        let isCurrentTurn = isAsyncActive || (lastTurns[conversation] == job.envelope.turnId
+            && latest[conversation].map { $0 == job.token } ?? true)
         return ExternalInjectionContext(
             isRunning: running,
             isCurrentTurn: isCurrentTurn,
             hasNoticeJob: hasNoticeJob,
-            hasActiveRequest: active.values.contains { $0.envelope.requestId == job.envelope.requestId },
+            hasActiveRequest: isAsyncActive || active.values.contains { $0.envelope.requestId == job.envelope.requestId },
             turns: turns,
             userText: job.envelope.payload.text
         )
@@ -418,9 +440,11 @@ public actor DeskPetPipeline {
                 facts: validated.facts
             )
             storeAction(job, result)
-            guard running,
-                  lastTurns[job.envelope.conversationId] == job.envelope.turnId,
-                  latest[job.envelope.conversationId].map({ $0 == job.token }) ?? true else { return }
+            guard running, !explicitlyCancelledRequests.contains(validated.requestId) else { return }
+            if !config.asyncHarnessAck {
+                guard lastTurns[job.envelope.conversationId] == job.envelope.turnId,
+                      latest[job.envelope.conversationId].map({ $0 == job.token }) ?? true else { return }
+            }
             if active[job.token] != nil { await cancelToken(job.token) }
             job.token = UUID(); job.admitted = ContinuousClock.now; job.output = nil; job.event = nil
             active[job.token] = job; latest[job.envelope.conversationId] = job.token
@@ -484,7 +508,13 @@ public actor DeskPetPipeline {
     }
     public func cancel(conversationId: String) async {
         let question = waitingQuestion.flatMap { $0.conversation == conversationId ? $0 : nil }
+        for (reqId, bg) in backgroundHarnessTokens where bg.conversation == conversationId {
+            explicitlyCancelledRequests.insert(reqId)
+            if let operations = cancellation[bg.token] { for cancel in operations.values { cancel() } }
+            backgroundHarnessTokens.removeValue(forKey: reqId)
+        }
         await cancelConversation(conversationId); clearQuestion(); await context.clearPending(conversationId)
+        pendingEurekaConfirmations.removeValue(forKey: conversationId)
         if let question, question.pendingId != nil, let consumer = adapters.harness as? any HarnessEventConsumer {
             try? await consumer.report(HarnessPipelineEvent(requestId: question.request, kind: "request_cancelled", pendingId: question.pendingId))
         }
@@ -542,6 +572,9 @@ public actor DeskPetPipeline {
         if !sttScore.isFinite || !(0...1).contains(sttScore) || sttScore < config.sttConfidenceThreshold {
             throw PipelineError("STT_CONFIDENCE_LOW", stage: "stt",
                                 message: "STT \(sttScore), 기준 \(config.sttConfidenceThreshold)")
+        }
+        if config.ruleBypassEnabled, let bypassed = await tryRuleBypass(original) {
+            return bypassed
         }
         if config.routingMode == .directLLM {
             let input = await context.prepare(original.envelope, resolution: .omitted)
@@ -605,6 +638,19 @@ public actor DeskPetPipeline {
             job.stamp = await context.commit(job.envelope, input: result.0, decision: result.1)
             guard job.stamp != nil else { throw PipelineError("STALE_CONTEXT", stage: "router") }
             active[job.token] = job; emit(.routed(job.envelope.requestId, result.1))
+            if let effect = pendingRuleEffects.removeValue(forKey: job.token) {
+                switch effect {
+                case .localReply(let text):
+                    job.output = OutputRequest(requestId: job.envelope.requestId, requiredText: text)
+                    await enqueue(job, into: outputQueue)
+                    return
+                case .eurekaConfirm(let confirmedRequest):
+                    job.decision = confirmedRequest.decision
+                    job.eurekaMutationApproved = true
+                    await dispatchAPI(job, harness: false)
+                    return
+                }
+            }
             switch result.1.route {
             case .eureka: await dispatchAPI(job, harness: false)
             case .harness:
@@ -677,6 +723,14 @@ public actor DeskPetPipeline {
             await enqueue(job, into: outputQueue); return
         }
         apiInFlight[original.token] = harness
+        if harness && config.asyncHarnessAck {
+            let intent = original.decision?.headOutputs.intention.value
+            if intent != .confirmApprove && intent != .confirmReject {
+                var ack = original; ack.terminal = false
+                ack.output = OutputRequest(requestId: original.envelope.requestId, requiredText: "확인해 볼게요.")
+                await enqueue(ack, into: outputQueue)
+            }
+        }
         do {
             if harness { try await harnessModule?.submit(original) }
             else { try await eurekaModule?.submit(original) }
@@ -694,18 +748,29 @@ public actor DeskPetPipeline {
         guard current(original), let decision = original.decision, let input = original.input else { throw CancellationError() }
         let job = original
         let request = ActionRequest(operationId: job.operationId, requestId: job.envelope.requestId,
-                                    decision: decision, deadlineAt: job.envelope.deadlineAt ?? .distantFuture)
+                                    decision: decision, deadlineAt: job.envelope.deadlineAt ?? .distantFuture,
+                                    mutationApproved: job.eurekaMutationApproved)
         records[job.envelope.requestId]?.operation = request
         records[job.envelope.requestId]?.action = nil
-        if harness {
+        let asyncHarness = harness && config.asyncHarnessAck
+        if harness && !asyncHarness {
             progressTimers[job.token] = Task { [weak self, config, job] in
                 do { try await Task.sleep(for: .seconds(config.progressDelay)); await self?.progress(job) } catch {}
             }
         }
+        let execToken: UUID
+        if asyncHarness {
+            let bgToken = UUID()
+            backgroundHarnessTokens[request.requestId] = (job.envelope.conversationId, bgToken)
+            execToken = bgToken
+        } else {
+            execToken = job.token
+        }
+        defer { if asyncHarness { backgroundHarnessTokens.removeValue(forKey: request.requestId) } }
         let start = ContinuousClock.now
         let response: HarnessResult
         do {
-            response = try await perform(token: job.token) { [job, adapters] in
+            response = try await perform(token: execToken) { [job, adapters] in
                 if let api {
                     var call = HarnessRequest(action: request, transcript: job.envelope.payload, context: input)
                     call.conversationId = job.envelope.conversationId
@@ -779,7 +844,20 @@ public actor DeskPetPipeline {
         } else {
             earlyNotices.removeValue(forKey: job.envelope.requestId)
         }
-        guard current(job) else { finish(job); return }
+        if harness && config.asyncHarnessAck {
+            guard running, !explicitlyCancelledRequests.contains(job.envelope.requestId) else { finish(job); return }
+            while running && speechSessions.values.contains(where: { $0.envelope.conversationId == job.envelope.conversationId }) {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard running, !explicitlyCancelledRequests.contains(job.envelope.requestId) else { finish(job); return }
+            if !current(job) {
+                active.removeValue(forKey: job.token)
+                job.token = UUID(); job.output = nil; job.event = nil
+                active[job.token] = job; latest[job.envelope.conversationId] = job.token
+            }
+        } else {
+            guard current(job) else { finish(job); return }
+        }
         if harness {
             let snapshot = await externalContextSnapshot(for: job, hasNoticeJob: noticeJobs[job.envelope.requestId] != nil)
             let fallback = factualText(response.action, resultText: response.resultText)
@@ -801,7 +879,13 @@ public actor DeskPetPipeline {
             }
             return
         }
-        if response.action.status == .needsClarification { await ask(job, question: response.question ?? "어느 대상을 말씀하시나요?", harnessResult: response.action); return }
+        if response.action.status == .needsClarification {
+            if config.ruleBypassEnabled, response.action.facts["questionKind"] == "confirmation" {
+                pendingEurekaConfirmations[job.envelope.conversationId] = (request, Date().addingTimeInterval(config.questionWait))
+            }
+            await ask(job, question: response.question ?? "어느 대상을 말씀하시나요?", harnessResult: response.action); return
+        }
+        pendingEurekaConfirmations.removeValue(forKey: job.envelope.conversationId)
         await context.clearPending(job.envelope.conversationId)
         let text = RoutingHintSanitizer.safeFallback(
             factualText(response.action, resultText: response.resultText),
@@ -813,6 +897,9 @@ public actor DeskPetPipeline {
     private func factualText(_ action: ActionResult, resultText: String?) -> String {
         switch action.status {
         case .succeeded:
+            if let resultText = RoutingHintSanitizer.sanitizeIncoming(resultText) {
+                return resultText
+            }
             let name = action.target?.name ?? "요청"
             switch action.action {
             case .postpone:
@@ -827,13 +914,12 @@ public actor DeskPetPipeline {
                 if let value = action.facts["priority"] { return "\(name) 우선순위를 \(labels[value] ?? value)으로 변경했어요." }
                 return "\(name) 우선순위를 변경했어요."
             case .query:
-                if let resultText { return resultText }
                 var text = action.facts["description"] ?? "\(name) 정보를 확인했어요."
                 if let value = action.facts["dueAt"], let date = ISO8601DateFormatter().date(from: value) {
                     text += " 마감은 \(DateCodec.humanDateTime(date))이에요."
                 }
                 return text
-            default: return resultText ?? "\(name) 처리 결과를 확인했어요."
+            default: return "\(name) 처리 결과를 확인했어요."
             }
         case .failed: return "요청을 처리하지 못했어요. \(action.error?.code ?? "오류")"
         case .unknown: return "요청이 반영됐는지 아직 확인하지 못했어요. 다시 실행하지 않고 상태 확인이 필요해요."
@@ -917,6 +1003,17 @@ public actor DeskPetPipeline {
     private func displayCommand(_ command: DisplayCommand, display: any DisplayAdapter) async -> Bool {
         switch command {
         case .output(let job): return await show(job, display: display)
+        case .activity(let requestId, let activity):
+            guard running else { return false }
+            let event = OutputEvent(
+                requestId: requestId, outputId: UUID(), text: "", emotion: "neutral",
+                activity: activity, displayState: activity.rawValue, displayMode: .face,
+                displayText: "", speech: SpeechPolicy(enabled: false)
+            )
+            do {
+                try await perform(token: activityDisplayToken) { try await display.show(event) }
+                return true
+            } catch { return false }
         case .idle:
             guard running, active.isEmpty else { return false }
             do {
@@ -926,6 +1023,7 @@ public actor DeskPetPipeline {
         }
     }
     private let idleDisplayToken = UUID()
+    private let activityDisplayToken = UUID()
     private func show(_ job: Job, display: any DisplayAdapter) async -> Bool {
         guard current(job), let event = job.event else { return false }
         var success = false
@@ -1088,9 +1186,12 @@ public actor DeskPetPipeline {
     public func interact(_ event: InteractionEvent) async {
         switch event {
         case .speechStarted(let conversation):
+            if let cue = adapters.soundCue { Task { await cue.play(.listenStart) } }
             let question = waitingQuestion.flatMap { $0.conversation == conversation ? $0 : nil }
             clearQuestion(); displayTimer?.cancel(); quietUntil = Date().addingTimeInterval(config.reminderQuietInterval)
             await cancelReminder(); emit(.activity(conversation, .listening))
+            let reqId = active.values.first { $0.envelope.conversationId == conversation }?.envelope.requestId ?? UUID()
+            try? await displayQueue.offer(.activity(reqId, .listening))
             if let question, question.pendingId != nil, let consumer = adapters.harness as? any HarnessEventConsumer {
                 try? await consumer.report(HarnessPipelineEvent(requestId: question.request, kind: "speech_started", pendingId: question.pendingId))
             }
@@ -1173,5 +1274,113 @@ public actor DeskPetPipeline {
               (result.error?.code.utf8.count ?? 0) <= 128,
               (result.error?.stage.utf8.count ?? 0) <= 128 else { throw PipelineError("RESULT_TOO_LARGE", stage: "reconcile") }
         records[request.requestId]?.action = result; emit(.action(request.requestId, result)); return result
+    }
+
+    private func tryRuleBypass(_ original: Job) async -> (RouterInput, RouteDecision)? {
+        let conversationId = original.envelope.conversationId
+        let text = original.envelope.payload.text
+
+        if let pending = pendingEurekaConfirmations[conversationId] {
+            if pending.expiresAt <= Date() {
+                pendingEurekaConfirmations.removeValue(forKey: conversationId)
+            } else if let answer = RuleBypass.confirmationAnswer(text) {
+                pendingEurekaConfirmations.removeValue(forKey: conversationId)
+                let input = await context.prepare(original.envelope, resolution: .omitted)
+                let sourceIds = input.turns.map(\.turnId) + [input.turnId]
+                if answer {
+                    pendingRuleEffects[original.token] = .eurekaConfirm(pending.request)
+                    var decision = pending.request.decision
+                    decision.overallConfidence = 1
+                    decision.confidenceSource = "rule-bypass-confirm"
+                    return (input, decision)
+                } else {
+                    pendingRuleEffects[original.token] = .localReply("요청을 취소했어요.")
+                    let heads = HeadOutputs(intent: .confirmReject, confidence: 1)
+                    var decision = RouteDecision(headOutputs: heads, overallConfidence: 1, missingRequiredSlots: [],
+                                                 route: .output, sourceTurnIds: sourceIds)
+                    decision.confidenceSource = "rule-bypass-reject"
+                    return (input, decision)
+                }
+            }
+        }
+
+        guard let action = RuleBypass.match(text) else { return nil }
+        let input = await context.prepare(original.envelope, resolution: .omitted)
+        let sourceIds = input.turns.map(\.turnId) + [input.turnId]
+
+        switch action {
+        case .eurekaFilter(let filter):
+            var heads = HeadOutputs(intent: .query, confidence: 1)
+            heads.modelIntention = Head(.eureka, confidence: 1)
+            heads.operation = Head("query", confidence: 1)
+            heads.filter = Head(filter, confidence: 1)
+            var decision = RouteDecision(headOutputs: heads, overallConfidence: 1, missingRequiredSlots: [],
+                                         route: .eureka, sourceTurnIds: sourceIds)
+            decision.confidenceSource = "rule-bypass-eureka-filter"
+            return (input, decision)
+
+        case .setTimer(let seconds, let label):
+            let timerId = UUID()
+            let fireAt = Date().addingTimeInterval(TimeInterval(seconds))
+            let task = Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .seconds(seconds))
+                    await self?.timerFired(id: timerId, label: label, conversationId: conversationId)
+                } catch {}
+            }
+            activeTimers[timerId] = (label: label, fireAt: fireAt, task: task)
+            pendingRuleEffects[original.token] = .localReply("\(label) 타이머를 맞췄어요.")
+        case .queryTimer:
+            let now = Date()
+            let activeList = activeTimers.values.filter { $0.fireAt > now }.sorted { $0.fireAt < $1.fireAt }
+            let reply: String
+            if activeList.isEmpty {
+                reply = "실행 중인 타이머가 없어요."
+            } else {
+                let items = activeList.prefix(3).map {
+                    let rem = max(1, Int($0.fireAt.timeIntervalSince(now).rounded()))
+                    return "\($0.label) 타이머 \(RuleBypass.formatDuration(rem)) 남았어요"
+                }
+                reply = items.joined(separator: ", ") + "."
+            }
+            pendingRuleEffects[original.token] = .localReply(reply)
+        case .cancelTimer:
+            let count = activeTimers.count
+            for t in activeTimers.values { t.task.cancel() }
+            activeTimers.removeAll()
+            pendingRuleEffects[original.token] = .localReply(count > 0 ? "타이머를 취소했어요." : "취소할 타이머가 없어요.")
+        case .acknowledgeReminder:
+            acknowledgeReminder()
+            pendingRuleEffects[original.token] = .localReply("알림을 확인했어요.")
+        case .snoozeReminder(let seconds):
+            snoozeReminder(seconds: TimeInterval(seconds))
+            pendingRuleEffects[original.token] = .localReply("\(RuleBypass.formatDuration(seconds)) 뒤에 다시 알려드릴게요.")
+        case .repeatLastReply:
+            let lastAssistant = input.turns.last(where: { $0.role == "assistant" })?.content
+            pendingRuleEffects[original.token] = .localReply(lastAssistant ?? "다시 말씀드릴 내용이 없어요.")
+        case .stopSpeaking:
+            break
+        }
+
+        var decision = RouteDecision(headOutputs: HeadOutputs(intent: .chat, confidence: 1), overallConfidence: 1,
+                                     missingRequiredSlots: [], route: .output, sourceTurnIds: sourceIds)
+        decision.confidenceSource = "rule-bypass"
+        return (input, decision)
+    }
+
+    private func timerFired(id: UUID, label: String, conversationId: String) async {
+        guard activeTimers.removeValue(forKey: id) != nil, running else { return }
+        while running && speechSessions.values.contains(where: { $0.envelope.conversationId == conversationId }) {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard running else { return }
+        let request = UUID()
+        guard (try? reserveRecord(request)) != nil else { return }
+        var job = Job(envelope: Envelope(requestId: request, conversationId: conversationId,
+                                         kind: "timer.fired", payload: Transcript(text: "", sttConfidence: 1)))
+        job.output = OutputRequest(requestId: request, requiredText: "\(label) 타이머가 끝났어요.")
+        active[job.token] = job; latest[conversationId] = job.token
+        recordConversations[request] = conversationId
+        await enqueue(job, into: outputQueue)
     }
 }

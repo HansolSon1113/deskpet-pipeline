@@ -10,6 +10,8 @@ public struct PipelineConfiguration: Sendable {
     /// Explicit terminal input is accepted at confidence 1 by user choice.
     /// Learned head/modelConfidence values remain unchanged.
     public var confirmedTextInput = false
+    public var asyncHarnessAck = false
+    public var ruleBypassEnabled = false
     public var queueCapacity = 16
     public var audioQueueCapacity = 2
     public var streamingFrameQueueCapacity = 64

@@ -207,10 +207,19 @@ public:
         }
         auto prompt=render(messages);auto ids=tokenize(prompt);
         if(!router) {
-            evaluate(ids,job,false);auto sampler=llama_sampler_init_greedy();std::string text;
+            evaluate(ids,job,false);
+            const auto *vocab=llama_model_get_vocab(weights.get());
+            auto sampler=llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(sampler,llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),64,1.0f,0.0f,1.5f));
+            llama_sampler_chain_add(sampler,llama_sampler_init_top_k(20));
+            llama_sampler_chain_add(sampler,llama_sampler_init_top_p(0.8f,1));
+            llama_sampler_chain_add(sampler,llama_sampler_init_temp(0.7f));
+            llama_sampler_chain_add(sampler,llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+            std::string text;
             try {for(int i=0;i<limit;++i) {
                 require(!job.cancelled,"CANCELLED");auto token=llama_sampler_sample(sampler,context.get(),-1);
-                if(llama_vocab_is_eog(llama_model_get_vocab(weights.get()),token)) break;
+                if(llama_vocab_is_eog(vocab,token)) break;
+                llama_sampler_accept(sampler,token);
                 text+=piece(token);auto b=llama_batch_init(1,0,1);b.n_tokens=1;b.token[0]=token;b.pos[0]=int(ids.size())+i;b.n_seq_id[0]=1;b.seq_id[0][0]=0;b.logits[0]=1;
                 auto rc=llama_decode(context.get(),b);llama_batch_free(b);require(rc==0,"GPU_DECODE_FAILED");
             }}catch(...){llama_sampler_free(sampler);throw;}llama_sampler_free(sampler);

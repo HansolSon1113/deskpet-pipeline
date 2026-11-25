@@ -32,6 +32,7 @@ public struct ServerEureka: EurekaAdapter {
             decision.removeValue(forKey: "resolvedTarget")
         }
         payload["decision"] = decision
+        payload["mutationApproved"] = request.mutationApproved
         let data = try await connection.call(kind, requestId: request.requestId, deadline: request.deadlineAt,
                                              payload: payload, replyKind: "action.result")
         return try ContractCodec.decoder().decode(ActionReply.self, from: data).local(request)
