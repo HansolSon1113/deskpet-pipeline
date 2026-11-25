@@ -19,7 +19,7 @@ if [ "$(uname -s)" = Darwin ]; then
     exit 1
   fi
   sdl_prefix=$(brew --prefix sdl2)
-  ttf_prefix=$(brew --prefix sdl2_ttf)
+  ttf_prefix=${DESKPET_SDL2_TTF_PREFIX:-$(brew --prefix sdl2_ttf)}
   if [ ! -d "$sdl_prefix/lib/cmake/SDL2" ] || [ ! -d "$ttf_prefix/lib/cmake/SDL2_ttf" ]; then
     echo '모의 화면 개발 패키지 준비: SDL2 / SDL2_ttf'
     HOMEBREW_NO_AUTO_UPDATE=1 brew install sdl2 sdl2_ttf

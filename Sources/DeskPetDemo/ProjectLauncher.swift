@@ -199,7 +199,11 @@ enum ProjectLauncher {
                 }
             }
             var serverArgs = ["node", "--import", "tsx", "scripts/server.ts"]
-            if !options.contains("--read-only") { serverArgs += ["--allow-github-writes", "--allow-eureka-writes"] }
+            if !options.contains("--read-only") {
+                serverArgs.append("--allow-github-writes")
+                // Harness는 운영 Eureka 쓰기를 거부하므로 개발 환경(flw-d1)일 때만 연다.
+                if environment["EUREKA_BASE_URL"]?.contains("/flw-d1") == true { serverArgs.append("--allow-eureka-writes") }
+            }
             if await welcomed(serverURL, token: environment["HARNESS_WS_TOKEN"]!) {
                 throw fault("HARNESS_ALREADY_RUNNING", "이미 Harness가 실행 중입니다. 기존 서버를 종료한 뒤 다시 실행하세요: \(serverURL.absoluteString)")
             }
