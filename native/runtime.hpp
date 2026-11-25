@@ -14,6 +14,21 @@
 #include <thread>
 #include <vector>
 using json = nlohmann::json;
+#if defined(__APPLE__)
+extern "C" {
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *);
+}
+struct ScopedAutoreleasePool {
+    void *token;
+    ScopedAutoreleasePool() : token(objc_autoreleasePoolPush()) {}
+    ~ScopedAutoreleasePool() { objc_autoreleasePoolPop(token); }
+    ScopedAutoreleasePool(const ScopedAutoreleasePool &) = delete;
+    ScopedAutoreleasePool &operator=(const ScopedAutoreleasePool &) = delete;
+};
+#else
+struct ScopedAutoreleasePool {};
+#endif
 inline void require(bool ok, const std::string &reason) { if (!ok) throw std::runtime_error(reason); }
 inline json read_json(const std::string &path) {
     std::ifstream in(path); require(bool(in), "FILE_NOT_FOUND: " + path); return json::parse(in);
@@ -37,6 +52,7 @@ public:
                 { std::unique_lock<std::mutex> lock(mutex); ready.wait(lock,[&]{return stopping || !pending.empty();});
                   if (pending.empty() && stopping) return;
                   job = pending.front(); pending.pop_front(); }
+                ScopedAutoreleasePool pool;
                 try { require(!job->cancelled, "CANCELLED"); job->output = infer(*job).dump();
                       require(!job->cancelled, "CANCELLED"); job->done.store(1, std::memory_order_release); }
                 catch (const std::exception &e) {

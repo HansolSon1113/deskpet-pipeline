@@ -46,6 +46,12 @@ private actor CueRecorder: SoundCuePlayer {
 struct RuleBypassAndAsyncTests {
     @Test func ruleBypassMatchesConcreteScenarios() {
         #expect(RuleBypass.match("오늘 할일 알려줘") == .eurekaFilter("today"))
+        #expect(RuleBypass.match("오늘 마감 조회해줘") == .eurekaFilter("today"))
+        #expect(RuleBypass.match("오늘 마감 알려줘") == .eurekaFilter("today"))
+        #expect(RuleBypass.match("오늘 마감") == nil)
+        #expect(RuleBypass.match("보고서 오늘 마감으로 바꿔줘") == nil)
+        #expect(RuleBypass.match("내일 마감으로 미뤄줘") == nil)
+        #expect(RuleBypass.match("급한 업무 등록해줘") == nil)
         #expect(RuleBypass.match("마감 지난 업무 뭐 있어") == .eurekaFilter("overdue"))
         #expect(RuleBypass.match("급한 일 보여줘") == .eurekaFilter("urgent"))
         #expect(RuleBypass.match("오늘 브리핑 해줘") == .eurekaFilter("briefing"))
@@ -87,7 +93,7 @@ struct RuleBypassAndAsyncTests {
         let pipeline = try DeskPetPipeline(adapters: adapters, configuration: config)
         await pipeline.start(automaticReminders: false)
 
-        _ = try await pipeline.submit(Envelope(conversationId: "c1", kind: "stt.final", payload: Transcript(text: "오늘 할 일")))
+        _ = try await pipeline.submit(Envelope(conversationId: "c1", kind: "stt.final", payload: Transcript(text: "오늘 할 일 알려줘")))
         while await pipeline.inFlightCount() > 0 { try await Task.sleep(for: .milliseconds(5)) }
         #expect(await eureka.calls.last?.decision.headOutputs.filter?.value == "today")
 

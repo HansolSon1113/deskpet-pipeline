@@ -1196,10 +1196,10 @@ if var stt = cfg.models["stt"] {
     cfg.models["stt"] = stt
 }
 
-// MARK: - TTS Configuration (Option 1: Qwen3-TTS 0.6B FP16 on Mac GPU/CoreML, Option 2 --low-memory: MeloTTS-Korean INT8 on Mac GPU/CoreML)
+// MARK: - TTS Configuration (Mac CPU to avoid CoreML dynamic-shape memory leak)
 if var tts = cfg.models["tts"] {
     tts.backend = "onnxruntime"
-    tts.device = "metal"
+    tts.device = "cpu"
     tts.library = nil
 
     if lowMemory {
@@ -1220,7 +1220,7 @@ if var tts = cfg.models["tts"] {
         }
         tts.contextTokens = 0
         tts.maxTokens = 0
-        if (tts.threads ?? 0) <= 0 { tts.threads = 2 }
+        if (tts.threads ?? 0) <= 0 || tts.threads == 2 { tts.threads = 4 }
         tts.paths = paths
     } else {
         let ttsDirs = matchingDirs(under: "tts", prefix: "qwen3-tts") + ["tts/qwen3-tts-12hz-0.6b-customvoice"]

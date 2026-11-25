@@ -413,6 +413,10 @@ struct OrtModule {
         Ort::SessionOptions options;
         options.SetIntraOpNumThreads(threads);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+#if defined(__APPLE__)
+        options.DisableMemPattern();
+        options.AddConfigEntry("session.memory.enable_memory_arena_shrinkage", "cpu:0");
+#endif
         if(device=="cuda") {
             OrtCUDAProviderOptions cuda_opts{};
             cuda_opts.cudnn_conv_algo_search=OrtCudnnConvAlgoSearchHeuristic;
