@@ -175,8 +175,24 @@ struct NativeDemo {
         if arguments.contains("--live") || keyboard {
             let display = hardwareDisplay
             if !noTTS {
+                let client = hardware
                 adapters.speaker = MacSpeakerAdapter(microphone: mic, onStarted: { id in
                     if let display { try? await display.audioStarted(outputId: id.uuidString) }
+                }, mirror: { speech in
+                    // Local Mac demo: mirror the played speech so the hardware mouth follows it.
+                    guard let client else { return }
+                    switch speech {
+                    case .begin(let rate):
+                        _ = try? await client.command("display.speech", fields: ["phase": .string("begin"),
+                            "format": .object(["sampleRate": .int(Int64(rate)), "channels": .int(1), "encoding": .string("s16le")])])
+                    case .audio(let pcm):
+                        for start in stride(from: 0, to: pcm.count, by: 32_768) {  // stay under the 64 KiB payload limit
+                            let piece = pcm.subdata(in: pcm.startIndex + start ..< pcm.startIndex + min(start + 32_768, pcm.count))
+                            _ = try? await client.command("display.speech", fields: ["phase": .string("audio")], data: piece)
+                        }
+                    case .started: _ = try? await client.command("display.speech", fields: ["phase": .string("started")])
+                    case .end: _ = try? await client.command("display.speech", fields: ["phase": .string("end")])
+                    }
                 })
             }
             if !keyboard { adapters.inputEpochValidator = mic }
