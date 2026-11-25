@@ -83,6 +83,9 @@ public final class MacMicrophoneSource: MicrophoneSource, AudioInputEpochValidat
     deinit { stop() }
 }
 
+/// Local Mac demo: the same PCM played on the Mac, mirrored to the hardware display so the mouth can follow it.
+public enum SpeechMirror: Sendable { case begin(sampleRate: Int), audio(Data), started, end }
+
 public final class MacSpeakerAdapter: SpeakerAdapter, @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -94,8 +97,10 @@ public final class MacSpeakerAdapter: SpeakerAdapter, @unchecked Sendable {
     private var formatRate: Int?
     private var outputId: UUID?
     private let onStarted: @Sendable (UUID) async -> Void
-    public init(microphone: MacMicrophoneSource, onStarted: @escaping @Sendable (UUID) async -> Void = { _ in }) {
-        self.onStarted = onStarted
+    private let mirror: @Sendable (SpeechMirror) async -> Void
+    public init(microphone: MacMicrophoneSource, onStarted: @escaping @Sendable (UUID) async -> Void = { _ in },
+                mirror: @escaping @Sendable (SpeechMirror) async -> Void = { _ in }) {
+        self.onStarted = onStarted; self.mirror = mirror
         self.microphone = microphone; engine.attach(player)
         engine.mainMixerNode.outputVolume = 0.25
     }
@@ -121,7 +126,9 @@ public final class MacSpeakerAdapter: SpeakerAdapter, @unchecked Sendable {
             engine.stop(); engine.disconnectNodeOutput(player)
             engine.connect(player, to: engine.mainMixerNode, format: format)
             try engine.start(); lock.withLock { formatRate = chunk.sampleRate }
+            await mirror(.begin(sampleRate: chunk.sampleRate))
         }
+        await mirror(.audio(chunk.data))
         buffer.frameLength = buffer.frameCapacity
         chunk.data.withUnsafeBytes { raw in
             let bytes = raw.bindMemory(to: UInt8.self)
@@ -135,7 +142,7 @@ public final class MacSpeakerAdapter: SpeakerAdapter, @unchecked Sendable {
             self.lock.withLock { if self.current == jobId { self.pending -= 1 } }
         }
         if !player.isPlaying {
-            player.play()
+            player.play(); await mirror(.started)
             if let id = lock.withLock({ outputId }) { await onStarted(id) }
         }
     }
@@ -143,10 +150,12 @@ public final class MacSpeakerAdapter: SpeakerAdapter, @unchecked Sendable {
         while lock.withLock({ current == jobId && pending > 0 }) { try await Task.sleep(for: .milliseconds(2)) }
         guard lock.withLock({ current == jobId && !failure && formatRate != nil }) else { throw PipelineError("AUDIO_OUTPUT_ERROR", stage: "speaker") }
         player.stop(); lock.withLock { current = nil; outputId = nil }; microphone.playbackGate(false)
+        await mirror(.end)
     }
     public func stop(jobId: UUID) async {
         guard lock.withLock({ current == jobId }) else { return }
         player.stop(); lock.withLock { current = nil; pending = 0; failure = true }; microphone.playbackGate(false)
+        await mirror(.end)
     }
     deinit { player.stop(); engine.stop() }
 }
