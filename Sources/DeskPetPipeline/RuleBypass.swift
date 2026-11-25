@@ -67,23 +67,29 @@ public enum RuleBypass {
         }
 
         // 5. Concrete Eureka filtered queries
-        if text.range(of: "(오늘[ ]?브리핑|하루[ ]?요약|오늘[ ]?일정[ ]?정리|아침[ ]?브리핑)", options: .regularExpression) != nil {
+        let isMutation = text.range(of: "(등록|추가|생성|만들|만들어|수정|변경|바꿔|바꾸|설정|미뤄|미루|연기|완료|끝냈|처리|삭제|지워|취소)", options: .regularExpression) != nil
+        let hasQueryCue = text.range(of: "(조회|알려|보여|뭐|무엇|있어|있나|있니|리스트|목록|확인|정리|요약|브리핑|몇[ ]?개|남았|남은)", options: .regularExpression) != nil
+
+        if !isMutation,
+           text.range(of: "(오늘[ ]?브리핑|하루[ ]?요약|오늘[ ]?일정[ ]?정리|아침[ ]?브리핑)", options: .regularExpression) != nil {
             return .eurekaFilter("briefing")
         }
-        if text.range(of: "(오늘[ ]?(할[ ]?일|마감|끝낼|끝내야)|오늘까지[ ]?(할|마감|업무))", options: .regularExpression) != nil {
-            return .eurekaFilter("today")
-        }
-        if text.range(of: "(내일[ ]?(할[ ]?일|마감|끝낼|끝내야)|내일까지[ ]?(할|마감|업무))", options: .regularExpression) != nil {
-            return .eurekaFilter("tomorrow")
-        }
-        if text.range(of: "(이번[ ]?주[ ]?(할[ ]?일|마감|업무))", options: .regularExpression) != nil {
-            return .eurekaFilter("this_week")
-        }
-        if text.range(of: "(밀린[ ]?(업무|일)|마감[ ]?지난|지연된[ ]?(업무|일)|늦은[ ]?(업무|일))", options: .regularExpression) != nil {
-            return .eurekaFilter("overdue")
-        }
-        if text.range(of: "(급한[ ]?(일|업무)|긴급[ ]?(업무|일)|우선순위[ ]?높은)", options: .regularExpression) != nil {
-            return .eurekaFilter("urgent")
+        if !isMutation && hasQueryCue {
+            if text.range(of: "(오늘[ ]?(할[ ]?일|마감|끝낼|끝내야)|오늘까지[ ]?(할|마감|업무))", options: .regularExpression) != nil {
+                return .eurekaFilter("today")
+            }
+            if text.range(of: "(내일[ ]?(할[ ]?일|마감|끝낼|끝내야)|내일까지[ ]?(할|마감|업무))", options: .regularExpression) != nil {
+                return .eurekaFilter("tomorrow")
+            }
+            if text.range(of: "(이번[ ]?주[ ]?(할[ ]?일|마감|업무))", options: .regularExpression) != nil {
+                return .eurekaFilter("this_week")
+            }
+            if text.range(of: "(밀린[ ]?(업무|일)|마감[ ]?지난|지연된[ ]?(업무|일)|늦은[ ]?(업무|일))", options: .regularExpression) != nil {
+                return .eurekaFilter("overdue")
+            }
+            if text.range(of: "(급한[ ]?(일|업무)|긴급[ ]?(업무|일)|우선순위[ ]?높은)", options: .regularExpression) != nil {
+                return .eurekaFilter("urgent")
+            }
         }
 
         return nil
